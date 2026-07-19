@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "id": "com.fantareal.tts-studio",
+  "name": "TTS Studio",
+  "description": "通过 GPT-SoVITS 为 Fantareal 原生聊天提供角色语音。",
+  "version": "0.1.0",
+  "publisher": "cOkieeman",
+  "compatibility": {
+    "hostApi": ">=1.0.0 <2.0.0",
+    "python": ">=3.11",
+    "platforms": ["windows"]
+  },
+  "entrypoints": {
+    "page": {
+      "type": "web",
+      "path": "web/index.html",
+      "bridge": "fantareal.extension.v1"
+    },
+    "service": {
+      "type": "python",
+      "module": "fantareal_tts_studio.service",
+      "protocol": "jsonrpc-2.0-stdio",
+      "lockfile": "uv.lock"
+    }
+  },
+  "contributes": {
+    "pages": [
+      {
+        "id": "tts-studio",
+        "title": "TTS Studio",
+        "description": "管理 GPT-SoVITS runtime、声线、模型和生成历史。",
+        "icon": "volume"
+      }
+    ],
+    "commands": [
+      {
+        "id": "tts-studio.open",
+        "title": "打开 TTS Studio",
+        "handler": {
+          "type": "page.open",
+          "page": "tts-studio"
+        }
+      }
+    ],
+    "providers": {
+      "tts": [
+        {
+          "id": "gpt-sovits",
+          "title": "GPT-SoVITS",
+          "outputMediaTypes": ["audio/wav", "audio/ogg", "audio/aac"],
+          "capabilities": []
+        }
+      ]
+    }
+  },
+  "permissions": [
+    "files.user-selected.read",
+    "storage.workspace",
+    "storage.settings",
+    "storage.data",
+    "storage.cache",
+    "storage.assets"
+  ]
+}

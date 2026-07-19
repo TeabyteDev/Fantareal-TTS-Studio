@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TTS Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">FANTAREAL TTS PROVIDER</p>
+          <h1>TTS Studio</h1>
+          <p>配置 GPT-SoVITS、声线与参考音频。聊天播放由 Fantareal 原生界面负责。</p>
+        </div>
+        <span id="hostStatus" class="badge">连接宿主中</span>
+      </header>
+
+      <div id="message" class="message" hidden></div>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="sectionHead">
+            <div>
+              <p class="eyebrow">PROVIDER</p>
+              <h2>连接与默认声线</h2>
+            </div>
+            <button id="healthButton" class="secondary" type="button">健康检查</button>
+          </div>
+          <label for="apiUrl">本地 GPT-SoVITS API</label>
+          <input id="apiUrl" type="url" value="http://127.0.0.1:9880" />
+          <p class="hint">只允许 loopback HTTP 地址，不允许远程主机。</p>
+          <label for="activeVoice">默认声线</label>
+          <select id="activeVoice"></select>
+          <div id="healthResult" class="statusBox">尚未检查</div>
+          <div class="buttonRow">
+            <button id="saveButton" class="primary" type="button">保存设置</button>
+            <button id="reloadButton" class="secondary" type="button">重新读取</button>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="sectionHead">
+            <div>
+              <p class="eyebrow">RUNTIME</p>
+              <h2>运行环境</h2>
+            </div>
+            <button id="runtimeButton" class="secondary" type="button">刷新</button>
+          </div>
+          <label for="runtimeDevice">算力版本</label>
+          <select id="runtimeDevice">
+            <option value="cpu">CPU（通用，约需 15 GiB 空间）</option>
+            <option value="cu126">NVIDIA CUDA 12.6（约需 25 GiB 空间）</option>
+            <option value="cu128">NVIDIA CUDA 12.8（约需 25 GiB 空间）</option>
+          </select>
+          <div id="runtimeStatus" class="statusBox">读取中</div>
+          <progress id="runtimeProgress" max="1" value="0"></progress>
+          <div id="runtimeInstallStatus" class="statusLine">等待操作</div>
+          <div class="buttonRow runtimeActions">
+            <button id="installRuntimeButton" class="primary" type="button">安装 runtime</button>
+            <button id="cancelRuntimeButton" type="button" disabled>取消安装</button>
+            <button id="launchRuntimeButton" type="button">启动 API</button>
+            <button id="stopRuntimeButton" type="button">停止 API</button>
+          </div>
+          <details class="runtimeLog">
+            <summary>安装 / 运行日志</summary>
+            <pre id="runtimeLog">暂无日志</pre>
+          </details>
+          <p class="hint">runtime 固定到已审核的 GPT-SoVITS commit；安装失败或取消不会覆盖当前可用版本。</p>
+        </article>
+
+        <article class="panel full">
+          <div class="sectionHead">
+            <div>
+              <p class="eyebrow">PREVIEW</p>
+              <h2>声线试听</h2>
+            </div>
+            <button id="previewButton" class="primary" type="button">生成试听</button>
+          </div>
+          <label for="previewText">试听文本（最大 500 字）</label>
+          <textarea id="previewText" maxlength="500" placeholder="输入一小段试听文本"></textarea>
+          <audio id="previewAudio" class="previewAudio" controls hidden></audio>
+          <p class="hint">试听复用与聊天朗读相同的 `tts.synthesize` 链路，只会向页面返回不超过 6 MiB 的音频。</p>
+        </article>
+
+        <article class="panel full">
+          <div class="sectionHead">
+            <div>
+              <p class="eyebrow">VOICE LIBRARY</p>
+              <h2>声线资产</h2>
+            </div>
+            <button id="addVoiceButton" class="secondary" type="button">新增声线</button>
+          </div>
+          <div class="assetButtons">
+            <button data-import-kind="gpt" type="button">导入 GPT `.ckpt`</button>
+            <button data-import-kind="sovits" type="button">导入 SoVITS `.pth/.pt`</button>
+            <button data-import-kind="audio" type="button">导入参考音频</button>
+            <button id="discoverButton" type="button">重新扫描</button>
+          </div>
+          <div id="voiceList" class="voiceList"></div>
+        </article>
+
+        <article class="panel full">
+          <div class="sectionHead">
+            <div>
+              <p class="eyebrow">HISTORY</p>
+              <h2>生成历史</h2>
+            </div>
+          </div>
+          <div id="historyList" class="historyList"></div>
+        </article>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
