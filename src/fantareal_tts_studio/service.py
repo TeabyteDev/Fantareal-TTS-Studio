@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 from uuid import uuid4
+
+from .model_pack import ModelPackError, scan_model_pack, validate_model_pack_manifest
 
 EXTENSION_ID = "com.fantareal.tts-studio"
 PROVIDER_ID = "gpt-sovits"
@@ -27,6 +30,8 @@ MAX_AUDIO_BYTES = 200 * 1024 * 1024
 MAX_HISTORY_ITEMS = 200
 MAX_PREVIEW_TEXT_CHARS = 500
 MAX_PREVIEW_AUDIO_BYTES = 6 * 1024 * 1024
+MODEL_PACK_REFERENCE_PREFIX = "model-pack:"
+ACTIVE_MODEL_PACK_KIND = "fantareal.active-model-pack"
 RUNTIME_DEVICES = {"cpu", "cu126", "cu128"}
 AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
 ASSET_RULES = {
@@ -49,6 +54,7 @@ DEFAULT_VOICE = {
     "promptText": "",
     "promptLanguage": "zh",
     "textLanguage": "zh",
+    "modelVersion": "v4",
 }
 DEFAULT_SETTINGS = {
     "apiUrl": DEFAULT_API_URL,
@@ -166,6 +172,47 @@ def contained_existing_file(root: Path, relative_path: Any) -> Path:
     return resolved
 
 
+def contained_existing_directory(root: Path, relative_path: Any) -> Path:
+    text = str(relative_path or "").strip().replace("\\", "/")
+    if not text or Path(text).is_absolute() or ".." in Path(text).parts:
+        raise RpcFailure(-32602, "directory path must be workspace-relative")
+    candidate = root.joinpath(*Path(text).parts)
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root.resolve(strict=True))
+    except (OSError, ValueError):
+        raise RpcFailure(-32602, "directory path escapes the allowed root") from None
+    if candidate.is_symlink() or os.path.islink(candidate) or not resolved.is_dir():
+        raise RpcFailure(-32602, "path is not a regular directory")
+    return resolved
+
+
+def contained_directory_grant(layout: StorageLayout, token: Any) -> Path:
+    token_text = str(token or "").strip().lower()
+    token_pattern = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    if not re.fullmatch(token_pattern, token_text):
+        raise RpcFailure(-32602, "directory token is invalid")
+    grant_path = layout.workspace / "input-directory-grants" / f"{token_text}.json"
+    if grant_path.is_symlink() or os.path.islink(grant_path) or not grant_path.is_file():
+        raise RpcFailure(-32602, "directory token is unavailable")
+    grant = read_json(grant_path, {})
+    if not isinstance(grant, dict) or grant.get("kind") != "fantareal.directory-grant":
+        raise RpcFailure(-32602, "directory grant is invalid")
+    if str(grant.get("token") or "").strip().lower() != token_text:
+        raise RpcFailure(-32602, "directory grant token does not match")
+    source_raw = grant.get("path")
+    if not isinstance(source_raw, str) or not Path(source_raw).is_absolute():
+        raise RpcFailure(-32602, "directory grant path is invalid")
+    source = Path(source_raw)
+    try:
+        resolved = source.resolve(strict=True)
+    except OSError:
+        raise RpcFailure(-32602, "directory grant path is unavailable") from None
+    if source.is_symlink() or os.path.islink(source) or not resolved.is_dir():
+        raise RpcFailure(-32602, "directory grant path is not a regular directory")
+    return resolved
+
+
 def asset_path(layout: StorageLayout, relative_path: Any, suffixes: set[str]) -> Path:
     path = contained_existing_file(layout.assets, relative_path)
     if path.suffix.lower() not in suffixes:
@@ -173,24 +220,65 @@ def asset_path(layout: StorageLayout, relative_path: Any, suffixes: set[str]) ->
     return path
 
 
+def model_pack_file(
+    service: TtsStudioService,
+    relative_path: Any,
+    suffixes: set[str],
+) -> Path:
+    text = str(relative_path or "").strip().replace("\\", "/")
+    if not text.startswith(MODEL_PACK_REFERENCE_PREFIX):
+        return asset_path(service._require_layout(), text, suffixes)
+    relative = text[len(MODEL_PACK_REFERENCE_PREFIX) :]
+    if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+        raise RpcFailure(-32602, "model pack path is invalid")
+    active = service.active_model_pack(required=True)
+    root = Path(active["root"])
+    candidate = root.joinpath(*Path(relative).parts)
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root.resolve(strict=True))
+    except (OSError, ValueError):
+        raise RpcFailure(-32602, "model pack path is unavailable") from None
+    if candidate.is_symlink() or os.path.islink(candidate) or not resolved.is_file():
+        raise RpcFailure(-32602, "model pack path is not a regular file")
+    if resolved.suffix.lower() not in suffixes:
+        raise RpcFailure(-32602, "model pack asset type is not supported")
+    allowed = {
+        str(item.get("path"))
+        for item in active["manifest"].get("files", [])
+        if str(item.get("role")) in {"gpt", "sovits", "audio", "pretrained"}
+    }
+    if relative not in allowed:
+        raise RpcFailure(-32602, "model pack path is not declared by the manifest")
+    return resolved
+
+
 def sanitize_voice(raw: Any, index: int) -> dict[str, Any]:
     source = raw if isinstance(raw, dict) else {}
     voice_id = safe_id(source.get("id"), f"voice-{index + 1}")
+    def sanitize_reference(value: Any) -> str:
+        text = str(value or "").strip().replace("\\", "/")
+        if text.startswith(MODEL_PACK_REFERENCE_PREFIX):
+            relative = text[len(MODEL_PACK_REFERENCE_PREFIX) :]
+            if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                return ""
+            return MODEL_PACK_REFERENCE_PREFIX + relative.lstrip("./")
+        if text and (Path(text).is_absolute() or ".." in Path(text).parts):
+            return ""
+        return text
+
     result = {
         "id": voice_id,
         "name": str(source.get("name") or voice_id).strip()[:120],
         "locale": str(source.get("locale") or "zh-CN").strip()[:32],
-        "gptWeights": str(source.get("gptWeights") or "").strip().replace("\\", "/"),
-        "sovitsWeights": str(source.get("sovitsWeights") or "").strip().replace("\\", "/"),
-        "referenceAudio": str(source.get("referenceAudio") or "").strip().replace("\\", "/"),
+        "gptWeights": sanitize_reference(source.get("gptWeights")),
+        "sovitsWeights": sanitize_reference(source.get("sovitsWeights")),
+        "referenceAudio": sanitize_reference(source.get("referenceAudio")),
         "promptText": str(source.get("promptText") or "").strip()[:4000],
         "promptLanguage": str(source.get("promptLanguage") or "zh").strip()[:16],
         "textLanguage": str(source.get("textLanguage") or "zh").strip()[:16],
+        "modelVersion": str(source.get("modelVersion") or "v4").strip()[:16],
     }
-    for key in ("gptWeights", "sovitsWeights", "referenceAudio"):
-        value = result[key]
-        if value and (Path(value).is_absolute() or ".." in Path(value).parts):
-            result[key] = ""
     return result
 
 
@@ -286,6 +374,14 @@ class TtsStudioService:
     def runtime_current_path(self) -> Path:
         return self._require_layout().assets / "runtime" / "current.json"
 
+    @property
+    def active_model_pack_path(self) -> Path:
+        return self._require_layout().data / "active-model-pack.json"
+
+    @property
+    def runtime_model_pack_config_path(self) -> Path:
+        return self._require_layout().data / "runtime-model-pack-config.json"
+
     def initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         permissions = params.get("permissions")
         required = {"storage.settings", "storage.data", "storage.cache", "storage.assets"}
@@ -309,6 +405,28 @@ class TtsStudioService:
         current = read_json(self.settings_path, DEFAULT_SETTINGS)
         return sanitize_settings(current)
 
+    def active_model_pack(self, *, required: bool = False) -> dict[str, Any] | None:
+        state = read_json(self.active_model_pack_path, {})
+        try:
+            if not isinstance(state, dict) or state.get("kind") != ACTIVE_MODEL_PACK_KIND:
+                raise ValueError
+            root = Path(str(state["root"])).resolve(strict=True)
+            if root.is_symlink() or os.path.islink(root) or not root.is_dir():
+                raise ValueError
+            manifest = validate_model_pack_manifest(state["manifest"], root)
+        except (KeyError, OSError, TypeError, ValueError, ModelPackError):
+            if required:
+                raise RpcFailure(-32056, "active model pack is unavailable") from None
+            return None
+        return {
+            "kind": ACTIVE_MODEL_PACK_KIND,
+            "root": str(root),
+            "packId": manifest["packId"],
+            "version": manifest["version"],
+            "manifest": manifest,
+            "activatedAt": str(state.get("activatedAt") or ""),
+        }
+
     def save_settings(self, raw: Any) -> dict[str, Any]:
         settings = sanitize_settings(raw, self.get_settings())
         atomic_write_json(self.settings_path, settings)
@@ -331,6 +449,16 @@ class TtsStudioService:
                 for path in sorted(root.iterdir(), key=lambda item: item.name.lower())
                 if path.is_file() and path.suffix.lower() in suffixes and not path.is_symlink()
             ][:300]
+        active = self.active_model_pack()
+        if active:
+            for item in active["manifest"]["files"]:
+                role = str(item.get("role") or "")
+                if role in {"gpt", "sovits", "audio"}:
+                    result.setdefault(role, []).append(
+                        MODEL_PACK_REFERENCE_PREFIX + str(item["path"])
+                    )
+            for kind in ("gpt", "sovits", "audio"):
+                result[kind] = result.get(kind, [])[:300]
         return result
 
     def import_asset(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -361,6 +489,65 @@ class TtsStudioService:
             "size": size,
         }
 
+    def inspect_model_pack(self, params: dict[str, Any]) -> dict[str, Any]:
+        layout = self._require_layout()
+        if params.get("directoryToken"):
+            source = contained_directory_grant(layout, params.get("directoryToken"))
+        else:
+            source = contained_existing_directory(layout.workspace, params.get("path"))
+        try:
+            return scan_model_pack(
+                source,
+                pack_id=str(params.get("packId") or "").strip() or None,
+                version=str(params.get("version") or "local").strip(),
+                compute_sha256=params.get("computeSha256") is True,
+            )
+        except ModelPackError as exc:
+            raise RpcFailure(-32054, str(exc)) from exc
+
+    def activate_model_pack(self, params: dict[str, Any]) -> dict[str, Any]:
+        layout = self._require_layout()
+        if not params.get("directoryToken"):
+            raise RpcFailure(-32602, "directoryToken is required")
+        source = contained_directory_grant(layout, params.get("directoryToken"))
+        raw_manifest = params.get("manifest")
+        try:
+            manifest = (
+                validate_model_pack_manifest(raw_manifest, source)
+                if isinstance(raw_manifest, dict)
+                else scan_model_pack(
+                    source,
+                    pack_id=str(params.get("packId") or source.name),
+                    version=str(params.get("version") or "local"),
+                )
+            )
+        except ModelPackError as exc:
+            raise RpcFailure(-32054, str(exc)) from exc
+        previous_running = self.runtime_process is not None and self.runtime_process.poll() is None
+        if previous_running:
+            self.stop_runtime()
+        state = {
+            "kind": ACTIVE_MODEL_PACK_KIND,
+            "root": str(source),
+            "packId": manifest["packId"],
+            "version": manifest["version"],
+            "manifest": manifest,
+            "activatedAt": utc_now(),
+        }
+        atomic_write_json(self.active_model_pack_path, state)
+        self.runtime_model_pack_config_path.unlink(missing_ok=True)
+        return {
+            "active": self.active_model_pack(required=True),
+            "assets": self.discover_assets(),
+            "runtimeRestarted": previous_running,
+        }
+
+    def deactivate_model_pack(self) -> dict[str, Any]:
+        self.stop_runtime()
+        self.active_model_pack_path.unlink(missing_ok=True)
+        self.runtime_model_pack_config_path.unlink(missing_ok=True)
+        return {"active": None, "assets": self.discover_assets()}
+
     def list_voices(self) -> dict[str, Any]:
         settings = self.get_settings()
         voices = [
@@ -382,6 +569,254 @@ class TtsStudioService:
             }
         except RpcFailure as exc:
             return {"available": False, "message": exc.message, "apiUrl": settings["apiUrl"]}
+
+    def readiness(self) -> dict[str, Any]:
+        """Return actionable diagnostics without starting processes."""
+        settings = self.get_settings()
+        checks: list[dict[str, Any]] = []
+
+        def check(check_id: str, ok: bool, code: str, message: str) -> None:
+            checks.append(
+                {
+                    "id": check_id,
+                    "ok": ok,
+                    "code": "ok" if ok else code,
+                    "message": message,
+                }
+            )
+
+        active_state_exists = self.active_model_pack_path.is_file()
+        active = self.active_model_pack()
+        if active_state_exists and active is None:
+            check(
+                "modelPack",
+                False,
+                "active_model_pack_unavailable",
+                "active model pack is unavailable; rescan and activate it again",
+            )
+        else:
+            check(
+                "modelPack",
+                True,
+                "ok",
+                "active model pack is valid" if active else "no external model pack is active",
+            )
+
+        voice = next(
+            (item for item in settings["voices"] if item["id"] == settings["activeVoiceId"]),
+            None,
+        )
+        if voice is None:
+            check("voice", False, "voice_not_configured", "active voice is not configured")
+        else:
+            check("voice", True, "ok", f"active voice: {voice['name']}")
+            reference_audio = str(voice.get("referenceAudio") or "").strip()
+            if not reference_audio:
+                check(
+                    "referenceAudio",
+                    False,
+                    "reference_audio_missing",
+                    "active voice reference audio is not configured",
+                )
+            else:
+                try:
+                    model_pack_file(self, reference_audio, AUDIO_SUFFIXES)
+                except RpcFailure as exc:
+                    check("referenceAudio", False, "reference_audio_unavailable", exc.message)
+                else:
+                    check("referenceAudio", True, "ok", "reference audio is available")
+
+            for key, suffixes, label, code in (
+                ("gptWeights", {".ckpt"}, "GPT weights", "gpt_weights_unavailable"),
+                ("sovitsWeights", {".pth", ".pt"}, "SoVITS weights", "sovits_weights_unavailable"),
+            ):
+                value = str(voice.get(key) or "").strip()
+                if not value:
+                    check(key, True, "ok", f"{label} will use runtime defaults")
+                    continue
+                try:
+                    model_pack_file(self, value, suffixes)
+                except RpcFailure as exc:
+                    check(key, False, code, exc.message)
+                else:
+                    check(key, True, "ok", f"{label} is available")
+
+        pointer = self._read_runtime_pointer()
+        check(
+            "runtimeInstalled",
+            pointer is not None,
+            "runtime_not_installed",
+            "GPT-SoVITS runtime is installed" if pointer else "GPT-SoVITS runtime is not installed",
+        )
+        process = self.runtime_process
+        running = process is not None and process.poll() is None
+        check(
+            "runtimeProcess",
+            running,
+            "runtime_not_running",
+            "runtime process is running" if running else "runtime process is not running",
+        )
+        probe = self.probe()
+        check(
+            "api",
+            bool(probe.get("available")),
+            "api_not_ready",
+            str(probe.get("message") or "GPT-SoVITS API is not ready"),
+        )
+
+        if active is not None and voice is not None:
+            try:
+                self._prepare_runtime_config(settings, voice, persist=False)
+            except RpcFailure as exc:
+                message = exc.message
+                code = (
+                    "pretrained_missing"
+                    if "pretrained directory" in message
+                    else "runtime_config_invalid"
+                )
+                check("runtimeConfig", False, code, message)
+            else:
+                check("runtimeConfig", True, "ok", "runtime model-pack config is valid")
+        else:
+            check("runtimeConfig", True, "ok", "runtime model-pack config is not required")
+
+        model_failures = [
+            item
+            for item in checks
+            if not item["ok"]
+            and item["id"]
+            in {
+                "modelPack",
+                "voice",
+                "referenceAudio",
+                "gptWeights",
+                "sovitsWeights",
+                "runtimeConfig",
+            }
+        ]
+        api_available = bool(probe.get("available"))
+        if model_failures:
+            first_failure = model_failures[0]
+            status = first_failure["code"]
+            ready = False
+            message = first_failure["message"]
+        elif api_available:
+            first_failure = None
+            status = "ready"
+            ready = True
+            message = (
+                "TTS runtime is ready"
+                if pointer or running
+                else "external GPT-SoVITS API is ready"
+            )
+        elif pointer is None:
+            first_failure = next(item for item in checks if item["id"] == "runtimeInstalled")
+            status = "runtime_not_installed"
+            ready = False
+            message = first_failure["message"]
+        elif not running:
+            first_failure = next(item for item in checks if item["id"] == "runtimeProcess")
+            status = "runtime_not_running"
+            ready = False
+            message = first_failure["message"]
+        else:
+            first_failure = next(item for item in checks if item["id"] == "api")
+            runtime_log = self._read_log_tail(self.runtime_log_path).lower()
+            port_conflict = any(
+                marker in runtime_log
+                for marker in ("address already in use", "winerror 10048", "10048")
+            )
+            status = "api_port_conflict" if port_conflict else "api_not_ready"
+            ready = False
+            message = (
+                "GPT-SoVITS API port is already in use"
+                if port_conflict
+                else first_failure["message"]
+            )
+        return {
+            "ready": ready,
+            "status": status,
+            "message": message,
+            "checks": checks,
+            "apiUrl": settings["apiUrl"],
+            "activeVoiceId": settings["activeVoiceId"],
+            "runtime": {
+                "installed": pointer,
+                "running": running,
+                "managed": bool(pointer or running),
+                "pid": process.pid if running else None,
+                "probe": probe,
+                "logTail": self._read_log_tail(self.runtime_log_path),
+            },
+        }
+
+    def runtime_smoke(self, params: dict[str, Any]) -> dict[str, Any]:
+        text = str(params.get("text") or "你好，这是 Fantareal TTS Studio 的测试声音。").strip()
+        if not text or len(text) > MAX_PREVIEW_TEXT_CHARS:
+            raise RpcFailure(
+                -32602, f"smoke text must contain 1-{MAX_PREVIEW_TEXT_CHARS} characters"
+            )
+        timeout_seconds = clamp_float(params.get("timeoutSeconds"), 1.0, 120.0, 30.0)
+        auto_launch = params.get("autoLaunch", True) is not False
+        started = False
+        readiness = self.readiness()
+        deadline = time.monotonic() + timeout_seconds
+
+        if not readiness["ready"] and auto_launch and readiness["status"] in {
+            "runtime_not_running",
+            "api_not_ready",
+        }:
+            if not readiness["runtime"]["installed"]:
+                return {
+                    "ok": False,
+                    "status": "runtime_not_installed",
+                    "message": "GPT-SoVITS runtime is not installed",
+                    "started": False,
+                    "readiness": readiness,
+                }
+            self.launch_runtime()
+            started = True
+
+        while not readiness["ready"] and time.monotonic() < deadline:
+            time.sleep(0.25)
+            readiness = self.readiness()
+
+        if not readiness["ready"]:
+            return {
+                "ok": False,
+                "status": readiness["status"],
+                "message": readiness["message"],
+                "started": started,
+                "readiness": readiness,
+                "runtimeLog": self._read_log_tail(self.runtime_log_path),
+            }
+
+        try:
+            result = self.preview(
+                {
+                    "text": text,
+                    "voiceId": readiness["activeVoiceId"],
+                    "requestId": safe_id(params.get("requestId"), f"smoke-{uuid4().hex}"),
+                }
+            )
+        except RpcFailure as exc:
+            return {
+                "ok": False,
+                "status": "synthesis_failed",
+                "message": exc.message,
+                "errorCode": exc.code,
+                "started": started,
+                "readiness": self.readiness(),
+                "runtimeLog": self._read_log_tail(self.runtime_log_path),
+            }
+        return {
+            "ok": True,
+            "status": "ready",
+            "message": "TTS smoke synthesis succeeded",
+            "started": started,
+            "readiness": readiness,
+            "audio": result["audio"],
+        }
 
     def synthesize(self, params: dict[str, Any]) -> dict[str, Any]:
         settings = self.get_settings()
@@ -608,6 +1043,12 @@ class TtsStudioService:
             return self.runtime_status()
         api_path = Path(pointer["runtimeRoot"]) / "api_v2.py"
         python_path = Path(pointer["python"])
+        settings = self.get_settings()
+        active_voice = next(
+            (voice for voice in settings["voices"] if voice["id"] == settings["activeVoiceId"]),
+            settings["voices"][0],
+        )
+        custom_config = self._prepare_runtime_config(settings, active_voice)
         parsed = urllib.parse.urlparse(self.get_settings()["apiUrl"])
         port = parsed.port or 9880
         command = [
@@ -618,6 +1059,8 @@ class TtsStudioService:
             "-p",
             str(port),
         ]
+        if custom_config is not None:
+            command.extend(["-c", str(custom_config)])
         self.runtime_log_path.write_bytes(b"")
         environment = os.environ.copy()
         environment["PYTHONUTF8"] = "1"
@@ -636,11 +1079,55 @@ class TtsStudioService:
             raise RpcFailure(-32046, f"failed to launch GPT-SoVITS: {exc}") from exc
         return self.runtime_status()
 
+    def _prepare_runtime_config(
+        self, settings: dict[str, Any], voice: dict[str, Any], *, persist: bool = True
+    ) -> Path | None:
+        active = self.active_model_pack()
+        if active is None:
+            self.runtime_model_pack_config_path.unlink(missing_ok=True)
+            return None
+        gpt = model_pack_file(self, voice.get("gptWeights"), {".ckpt"})
+        sovits = model_pack_file(self, voice.get("sovitsWeights"), {".pth", ".pt"})
+        root = Path(active["root"])
+
+        def find_directory(name: str) -> Path:
+            candidates = [
+                root / "runtime" / "GPT-SoVITS" / "GPT_SoVITS" / "pretrained_models" / name,
+                root / "GPT-SoVITS" / "GPT_SoVITS" / "pretrained_models" / name,
+                root / "GPT_SoVITS" / "pretrained_models" / name,
+                root / "pretrained_models" / name,
+            ]
+            for candidate in candidates:
+                if (
+                    candidate.is_dir()
+                    and not candidate.is_symlink()
+                    and not os.path.islink(candidate)
+                ):
+                    return candidate.resolve(strict=True)
+            raise RpcFailure(-32057, f"active model pack is missing pretrained directory: {name}")
+
+        version = str(voice.get("modelVersion") or "v4")
+        device = "cuda" if settings["runtimeDevice"] in {"cu126", "cu128"} else "cpu"
+        config = {
+            "custom": {
+                "bert_base_path": str(find_directory("chinese-roberta-wwm-ext-large")),
+                "cnhuhbert_base_path": str(find_directory("chinese-hubert-base")),
+                "device": device,
+                "is_half": device == "cuda",
+                "t2s_weights_path": str(gpt),
+                "version": version,
+                "vits_weights_path": str(sovits),
+            }
+        }
+        if persist:
+            atomic_write_json(self.runtime_model_pack_config_path, config)
+        return self.runtime_model_pack_config_path
+
     def runtime_status(self) -> dict[str, Any]:
         process = self.runtime_process
         running = process is not None and process.poll() is None
         pointer = self._read_runtime_pointer()
-        return {
+        status = {
             "installed": pointer,
             "runtimeRoot": pointer.get("runtimeRoot", "") if pointer else "",
             "apiExists": bool(pointer and pointer.get("apiExists")),
@@ -652,6 +1139,8 @@ class TtsStudioService:
             "installSupported": True,
             "logTail": self._read_log_tail(self.runtime_log_path),
         }
+        status["readiness"] = self.readiness()
+        return status
 
     def stop_runtime(self) -> dict[str, Any]:
         if self.runtime_process is not None and self.runtime_process.poll() is None:
@@ -771,6 +1260,7 @@ class TtsStudioService:
             return {
                 "settings": self.get_settings(),
                 "assets": self.discover_assets(),
+                "modelPack": self.active_model_pack(),
                 "history": self.read_history(),
                 "runtime": self.runtime_status(),
             }
@@ -780,6 +1270,12 @@ class TtsStudioService:
             return {"assets": self.discover_assets()}
         if method == "ttsStudio.importAsset":
             return {"item": self.import_asset(values), "assets": self.discover_assets()}
+        if method == "ttsStudio.inspectModelPack":
+            return {"manifest": self.inspect_model_pack(values)}
+        if method == "ttsStudio.activateModelPack":
+            return self.activate_model_pack(values)
+        if method == "ttsStudio.deactivateModelPack":
+            return self.deactivate_model_pack()
         if method == "ttsStudio.history":
             return {"items": self.read_history()}
         if method == "ttsStudio.deleteHistory":
@@ -802,6 +1298,10 @@ class TtsStudioService:
             return self.launch_runtime()
         if method == "ttsStudio.runtimeStatus":
             return self.runtime_status()
+        if method == "ttsStudio.readiness":
+            return self.readiness()
+        if method == "ttsStudio.runtimeSmoke":
+            return self.runtime_smoke(values)
         if method == "ttsStudio.runtimeStop":
             return self.stop_runtime()
         raise RpcFailure(-32601, "Method not found")
@@ -823,11 +1323,10 @@ class TtsStudioService:
         voice: dict[str, Any],
         cancel_event: threading.Event,
     ) -> bytes:
-        layout = self._require_layout()
         reference_audio = voice["referenceAudio"]
         if not reference_audio:
             raise RpcFailure(-32043, "voice reference audio is not configured")
-        reference = asset_path(layout, reference_audio, AUDIO_SUFFIXES)
+        reference = model_pack_file(self, reference_audio, AUDIO_SUFFIXES)
         prompt_text = voice["promptText"].strip() or reference.stem
         if not prompt_text:
             raise RpcFailure(-32602, "voice reference text is required")
@@ -839,7 +1338,7 @@ class TtsStudioService:
         ):
             relative = voice[key]
             if relative:
-                weight = asset_path(layout, relative, suffixes)
+                weight = model_pack_file(self, relative, suffixes)
                 query = urllib.parse.urlencode({"weights_path": str(weight)})
                 self._request_bytes(
                     f"{settings['apiUrl']}{endpoint}?{query}",

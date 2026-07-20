@@ -48,6 +48,7 @@ textarea { min-height: 90px; resize: vertical; }
 .message.error { color: var(--danger); border-color: rgba(241, 140, 140, 0.35); }
 .buttonRow { margin-top: 14px; }
 .runtimeActions { flex-wrap: wrap; }
+.modelPackActions { flex-wrap: wrap; margin-top: 0; }
 .assetButtons { flex-wrap: wrap; margin-bottom: 14px; }
 button { min-height: 40px; padding: 0 14px; border: 1px solid var(--line); border-radius: 12px; color: var(--text); background: rgba(255, 255, 255, 0.05); cursor: pointer; }
 button:hover { border-color: rgba(102, 212, 180, 0.45); }
@@ -55,6 +56,11 @@ button:disabled { opacity: 0.5; cursor: default; }
 .primary { border: 0; color: #07130f; font-weight: 800; background: var(--accent); }
 .voiceList, .historyList { display: grid; gap: 12px; }
 .voiceCard, .historyCard { padding: 15px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255, 255, 255, 0.035); }
+.modelPackSummary { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.modelPackSummary span { padding: 8px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: rgba(255, 255, 255, 0.035); font-size: 12px; }
+.modelPackVoices { display: grid; gap: 8px; margin-top: 14px; }
+.modelPackVoice { display: grid; gap: 4px; padding: 11px 12px; border-left: 3px solid var(--accent); border-radius: 10px; background: rgba(255, 255, 255, 0.035); }
+.modelPackVoice code, .modelPackVoice small { overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }
 .voiceGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .voiceCardHeader { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
 .historyCard p { margin: 5px 0 0; color: var(--muted); }
