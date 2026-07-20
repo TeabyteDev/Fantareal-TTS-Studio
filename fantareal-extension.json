@@ -55,6 +55,7 @@
   },
   "permissions": [
     "files.user-selected.read",
+    "files.user-selected.directory-read",
     "storage.workspace",
     "storage.settings",
     "storage.data",

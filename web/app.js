@@ -8,7 +8,9 @@
     history: [],
     runtime: null,
     install: null,
-    runtimePollTimer: null
+    runtimePollTimer: null,
+    modelPack: null,
+    smokeRunning: false
   };
   const $ = (selector) => document.querySelector(selector);
   const elements = {
@@ -19,6 +21,7 @@
     healthResult: $("#healthResult"),
     runtimeDevice: $("#runtimeDevice"),
     runtimeStatus: $("#runtimeStatus"),
+    runtimeReadiness: $("#runtimeReadiness"),
     runtimeProgress: $("#runtimeProgress"),
     runtimeInstallStatus: $("#runtimeInstallStatus"),
     runtimeLog: $("#runtimeLog"),
@@ -26,11 +29,19 @@
     cancelRuntimeButton: $("#cancelRuntimeButton"),
     launchRuntimeButton: $("#launchRuntimeButton"),
     stopRuntimeButton: $("#stopRuntimeButton"),
+    checkReadinessButton: $("#checkReadinessButton"),
+    runtimeSmokeButton: $("#runtimeSmokeButton"),
     previewButton: $("#previewButton"),
     previewText: $("#previewText"),
     previewAudio: $("#previewAudio"),
     voiceList: $("#voiceList"),
-    historyList: $("#historyList")
+    historyList: $("#historyList"),
+    modelPackStatus: $("#modelPackStatus"),
+    modelPackSummary: $("#modelPackSummary"),
+    modelPackVoices: $("#modelPackVoices"),
+    pickModelPackButton: $("#pickModelPackButton"),
+    activateModelPackButton: $("#activateModelPackButton"),
+    deactivateModelPackButton: $("#deactivateModelPackButton")
   };
 
   function showMessage(message, error = false) {
@@ -122,9 +133,102 @@
     });
   }
 
+  function formatBytes(value) {
+    const bytes = Number(value) || 0;
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ["KiB", "MiB", "GiB", "TiB"];
+    let size = bytes;
+    let index = -1;
+    do {
+      size /= 1024;
+      index += 1;
+    } while (size >= 1024 && index < units.length - 1);
+    return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
+  }
+
+  function renderModelPack(modelPack) {
+    const manifest = modelPack?.manifest;
+    if (!manifest) {
+      elements.modelPackStatus.textContent = "尚未选择本地模型目录";
+      elements.modelPackSummary.hidden = true;
+      elements.modelPackVoices.hidden = true;
+      elements.modelPackSummary.replaceChildren();
+      elements.modelPackVoices.replaceChildren();
+      elements.activateModelPackButton.disabled = true;
+      elements.deactivateModelPackButton.disabled = true;
+      return;
+    }
+    const summary = manifest.summary || {};
+    const roles = summary.roles || {};
+    const activeLabel = modelPack.active ? "已激活" : "已扫描，尚未激活";
+    elements.modelPackStatus.textContent = `${activeLabel} ${manifest.packId || "local-model-pack"} · ${manifest.version || "local"}`;
+    elements.activateModelPackButton.disabled = Boolean(modelPack.active) || !modelPack.directoryToken;
+    elements.deactivateModelPackButton.disabled = !modelPack.active;
+    elements.modelPackSummary.hidden = false;
+    elements.modelPackSummary.innerHTML = [
+      `<span>文件 ${Number(summary.fileCount) || 0}</span>`,
+      `<span>体积 ${formatBytes(summary.bytes)}</span>`,
+      `<span>GPT ${Number(roles.gpt) || 0}</span>`,
+      `<span>SoVITS ${Number(roles.sovits) || 0}</span>`,
+      `<span>预训练 ${Number(roles.pretrained) || 0}</span>`,
+      `<span>参考音频 ${Number(roles.audio) || 0}</span>`
+    ].join("");
+    const voices = manifest.voices || [];
+    elements.modelPackVoices.hidden = false;
+    if (!voices.length) {
+      elements.modelPackVoices.innerHTML = '<div class="empty">没有可自动生成的权重候选；请在声线资产中手动映射。</div>';
+      return;
+    }
+    elements.modelPackVoices.innerHTML = `<strong>权重候选（仅供参考）</strong>${voices.map((voice) => `
+      <div class="modelPackVoice">
+        <span>${escapeHtml(voice.name || voice.id)}</span>
+        <code>${escapeHtml(voice.gptWeights || "未找到 GPT")} · ${escapeHtml(voice.sovitsWeights || "未找到 SoVITS")}</code>
+        <small>${voice.referenceAudio ? `同名参考音频候选：${escapeHtml(voice.referenceAudio)}` : "未自动绑定参考音频"}</small>
+        <button type="button" data-apply-model-voice="${escapeHtml(voice.id)}">应用权重候选</button>
+      </div>`).join("")}`;
+    elements.modelPackVoices.querySelectorAll("[data-apply-model-voice]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const voice = voices.find((item) => item.id === button.dataset.applyModelVoice);
+        if (!voice || !state.settings) return;
+        const next = {
+          id: voice.id,
+          name: voice.name || voice.id,
+          locale: "zh-CN",
+          gptWeights: voice.gptWeights ? `model-pack:${voice.gptWeights}` : "",
+          sovitsWeights: voice.sovitsWeights ? `model-pack:${voice.sovitsWeights}` : "",
+          referenceAudio: "",
+          promptText: "",
+          promptLanguage: "zh",
+          textLanguage: "zh",
+          modelVersion: "v4"
+        };
+        const index = state.settings.voices.findIndex((item) => item.id === next.id);
+        if (index >= 0) state.settings.voices[index] = next;
+        else state.settings.voices.push(next);
+        state.settings.activeVoiceId = next.id;
+        renderVoices();
+        showMessage("已应用权重候选；请为该声线选择参考音频并保存设置。 ");
+      });
+    });
+  }
+
   function renderRuntime(runtime) {
     const probe = runtime?.probe || {};
     const installed = runtime?.installed;
+    const readiness = runtime?.readiness || {};
+    const readinessLabels = {
+      ready: "TTS ready",
+      runtime_not_installed: "runtime not installed",
+      runtime_not_running: "runtime not running",
+      api_not_ready: "API not ready",
+      api_port_conflict: "API port already in use",
+      active_model_pack_unavailable: "model pack unavailable",
+      voice_not_configured: "voice not configured",
+      reference_audio_missing: "reference audio missing",
+      reference_audio_unavailable: "reference audio unavailable",
+      pretrained_missing: "pretrained directory missing",
+      synthesis_failed: "synthesis failed"
+    };
     elements.runtimeStatus.textContent = [
       installed ? `${installed.version || "GPT-SoVITS"} · ${String(installed.commit || "").slice(0, 10)}` : "尚未安装 runtime",
       runtime?.running ? `runtime 运行中 (PID ${runtime.pid})` : "runtime 未由插件启动",
@@ -132,6 +236,8 @@
     ].join(" · ");
     elements.launchRuntimeButton.disabled = !installed || Boolean(runtime?.running) || Boolean(probe.available);
     elements.stopRuntimeButton.disabled = !runtime?.running;
+    elements.runtimeReadiness.textContent = `${readinessLabels[readiness.status] || readiness.status || "readiness pending"} · ${readiness.message || ""}`;
+    elements.runtimeSmokeButton.disabled = state.smokeRunning;
   }
 
   function renderInstall(install) {
@@ -174,6 +280,19 @@
     scheduleRuntimePoll();
   }
 
+  async function refreshReadiness() {
+    const readiness = await invoke("ttsStudio.readiness");
+    state.runtime = { ...(state.runtime || {}), readiness };
+    renderRuntime(state.runtime);
+    return readiness;
+  }
+
+  function showAudio(audio) {
+    elements.previewAudio.src = `data:${audio.mediaType};base64,${audio.base64}`;
+    elements.previewAudio.hidden = false;
+    return elements.previewAudio.play().catch(() => {});
+  }
+
   async function loadState() {
     showMessage("");
     const result = await invoke("ttsStudio.getState");
@@ -181,10 +300,14 @@
     state.assets = result.assets || state.assets;
     state.history = result.history || [];
     state.runtime = result.runtime;
+    state.modelPack = result.modelPack
+      ? { ...result.modelPack, active: true, manifest: result.modelPack.manifest }
+      : null;
     elements.apiUrl.value = state.settings.apiUrl;
     elements.runtimeDevice.value = state.settings.runtimeDevice || "cpu";
     renderVoices();
     renderHistory();
+    renderModelPack(state.modelPack);
     renderRuntime(result.runtime);
     await refreshRuntime();
   }
@@ -209,6 +332,29 @@
     showMessage(`已导入 ${result.item?.name || file.name}`);
   }
 
+  async function inspectModelPack() {
+    if (!host.pickDirectory) {
+      throw new Error("当前宿主不支持目录选择，请更新 Fantareal Extension Platform");
+    }
+    const selected = await host.pickDirectory();
+    if (!selected) return;
+    elements.modelPackStatus.textContent = `正在扫描 ${selected.name || "本地模型目录"}…`;
+    const result = await invoke("ttsStudio.inspectModelPack", {
+      directoryToken: selected.directoryToken,
+      packId: selected.name || "local-model-pack",
+      version: "local",
+      computeSha256: false
+    });
+    state.modelPack = {
+      name: selected.name || "本地模型目录",
+      directoryToken: selected.directoryToken,
+      manifest: result.manifest,
+      active: false
+    };
+    renderModelPack(state.modelPack);
+    showMessage("本地模型目录扫描完成；模型文件仍保留在原位置。 ");
+  }
+
   $("#saveButton").addEventListener("click", () => saveSettings().catch((error) => showMessage(error.message, true)));
   $("#reloadButton").addEventListener("click", () => loadState().catch((error) => showMessage(error.message, true)));
   $("#healthButton").addEventListener("click", async () => {
@@ -219,6 +365,15 @@
   });
   $("#runtimeButton").addEventListener("click", async () => {
     try { await refreshRuntime(); } catch (error) { showMessage(error.message, true); }
+  });
+  elements.checkReadinessButton.addEventListener("click", async () => {
+    try {
+      const readiness = await refreshReadiness();
+      showMessage(
+        readiness.ready ? "TTS ready for synthesis" : `${readiness.status}: ${readiness.message}`,
+        !readiness.ready
+      );
+    } catch (error) { showMessage(error.message, true); }
   });
   elements.installRuntimeButton.addEventListener("click", async () => {
     try {
@@ -251,6 +406,33 @@
       showMessage("GPT-SoVITS API 已停止。");
     } catch (error) { showMessage(error.message, true); }
   });
+  elements.runtimeSmokeButton.addEventListener("click", async () => {
+    state.smokeRunning = true;
+    renderRuntime(state.runtime);
+    try {
+      const text = elements.previewText.value.trim() || "你好，这是 Fantareal TTS Studio 的测试声音。";
+      const result = await invoke("ttsStudio.runtimeSmoke", {
+        text,
+        requestId: `smoke-${Date.now()}`,
+        timeoutSeconds: 30,
+        autoLaunch: true
+      });
+      state.runtime = { ...(state.runtime || {}), readiness: result.readiness };
+      renderRuntime(state.runtime);
+      if (!result.ok) {
+        showMessage(`${result.status}: ${result.message}`, true);
+        return;
+      }
+      await showAudio(result.audio);
+      showMessage(`Sound smoke test succeeded · ${result.audio.size} bytes`);
+    } catch (error) {
+      showMessage(error.message, true);
+    } finally {
+      state.smokeRunning = false;
+      renderRuntime(state.runtime);
+    }
+  });
+
   elements.previewButton.addEventListener("click", async () => {
     const text = elements.previewText.value.trim();
     if (!text) {
@@ -265,9 +447,7 @@
         text
       });
       const audio = result.audio;
-      elements.previewAudio.src = `data:${audio.mediaType};base64,${audio.base64}`;
-      elements.previewAudio.hidden = false;
-      await elements.previewAudio.play().catch(() => {});
+      await showAudio(audio);
       showMessage(`试听已生成 · ${audio.size} bytes`);
       const history = await invoke("ttsStudio.history");
       state.history = history.items || [];
@@ -284,6 +464,38 @@
       state.assets = result.assets || state.assets;
       renderVoices();
       showMessage("已重新扫描 assets 声线库。");
+    } catch (error) { showMessage(error.message, true); }
+  });
+  $("#pickModelPackButton").addEventListener("click", () => {
+    inspectModelPack().catch((error) => {
+      renderModelPack(null);
+      showMessage(error.message, true);
+    });
+  });
+  elements.activateModelPackButton.addEventListener("click", async () => {
+    try {
+      if (!state.modelPack?.directoryToken) throw new Error("请先选择模型目录");
+      const result = await invoke("ttsStudio.activateModelPack", {
+        directoryToken: state.modelPack.directoryToken,
+        manifest: state.modelPack.manifest,
+        packId: state.modelPack.manifest.packId,
+        version: state.modelPack.manifest.version
+      });
+      state.assets = result.assets || state.assets;
+      state.modelPack = { ...result.active, active: true };
+      renderModelPack(state.modelPack);
+      renderVoices();
+      showMessage("模型包已激活；如已运行 runtime，请重新启动 API。 ");
+    } catch (error) { showMessage(error.message, true); }
+  });
+  elements.deactivateModelPackButton.addEventListener("click", async () => {
+    try {
+      const result = await invoke("ttsStudio.deactivateModelPack");
+      state.assets = result.assets || state.assets;
+      state.modelPack = null;
+      renderModelPack(null);
+      renderVoices();
+      showMessage("模型包已停用。 ");
     } catch (error) { showMessage(error.message, true); }
   });
   $("#addVoiceButton").addEventListener("click", () => {

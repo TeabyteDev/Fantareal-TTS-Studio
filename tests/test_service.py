@@ -234,6 +234,200 @@ def test_import_asset_from_workspace_and_reject_escape(tmp_path: Path) -> None:
     assert escaped["error"]["code"] == -32602
 
 
+def test_inspect_model_pack_is_workspace_relative_and_read_only(tmp_path: Path) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    pack = paths["workspace"] / "model-pack"
+    (pack / "runtime/voices/gpt").mkdir(parents=True)
+    (pack / "runtime/voices/sovits").mkdir(parents=True)
+    (pack / "runtime/voices/audio").mkdir(parents=True)
+    (pack / "runtime/voices/gpt/hero.ckpt").write_bytes(b"gpt")
+    (pack / "runtime/voices/sovits/hero.pth").write_bytes(b"sovits")
+    (pack / "runtime/voices/audio/hero.wav").write_bytes(b"audio")
+
+    inspected = handle_request(
+        service,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ttsStudio.inspectModelPack",
+            "params": {"path": "model-pack", "computeSha256": True},
+        },
+    )
+
+    assert inspected is not None
+    manifest = inspected["result"]["manifest"]
+    assert manifest["summary"]["fileCount"] == 3
+    assert manifest["voices"][0]["id"] == "hero"
+    assert not (paths["assets"] / "model-packs").exists()
+
+    escaped = handle_request(
+        service,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "ttsStudio.inspectModelPack",
+            "params": {"path": "../model-pack"},
+        },
+    )
+    assert escaped is not None
+    assert escaped["error"]["code"] == -32602
+
+
+def test_inspect_model_pack_accepts_host_directory_grant_without_copying(
+    tmp_path: Path,
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    pack = tmp_path / "legacy-webui-models"
+    (pack / "voices/gpt").mkdir(parents=True)
+    (pack / "voices/gpt/hero.ckpt").write_bytes(b"gpt")
+    token = "12345678-1234-1234-1234-123456789abc"
+    grant_dir = paths["workspace"] / "input-directory-grants"
+    grant_dir.mkdir(parents=True)
+    (grant_dir / f"{token}.json").write_text(
+        json.dumps(
+            {
+                "kind": "fantareal.directory-grant",
+                "token": token,
+                "path": str(pack),
+                "readOnly": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inspected = handle_request(
+        service,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ttsStudio.inspectModelPack",
+            "params": {"directoryToken": token},
+        },
+    )
+
+    assert inspected is not None
+    assert inspected["result"]["manifest"]["summary"]["fileCount"] == 1
+    assert not (paths["assets"] / "model-packs").exists()
+
+
+def test_activate_model_pack_persists_external_references_and_runtime_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    pack = tmp_path / "legacy-webui-models"
+    for directory in (
+        "pretrained_models/chinese-roberta-wwm-ext-large",
+        "pretrained_models/chinese-hubert-base",
+        "voices/gpt",
+        "voices/sovits",
+        "voices/audio",
+    ):
+        (pack / directory).mkdir(parents=True)
+    (pack / "pretrained_models/chinese-roberta-wwm-ext-large/config.json").write_text("{}")
+    (pack / "pretrained_models/chinese-hubert-base/config.json").write_text("{}")
+    (pack / "voices/gpt/hero.ckpt").write_bytes(b"gpt")
+    (pack / "voices/sovits/hero.pth").write_bytes(b"sovits")
+    (pack / "voices/audio/ref.wav").write_bytes(b"audio")
+    token = "12345678-1234-1234-1234-123456789abc"
+    grant_dir = paths["workspace"] / "input-directory-grants"
+    grant_dir.mkdir(parents=True)
+    (grant_dir / f"{token}.json").write_text(
+        json.dumps(
+            {
+                "kind": "fantareal.directory-grant",
+                "token": token,
+                "path": str(pack),
+                "readOnly": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    activated = handle_request(
+        service,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ttsStudio.activateModelPack",
+            "params": {"directoryToken": token, "packId": "legacy-webui-models"},
+        },
+    )
+
+    assert activated is not None
+    assert activated["result"]["active"]["packId"] == "legacy-webui-models"
+    assert "model-pack:voices/gpt/hero.ckpt" in activated["result"]["assets"]["gpt"]
+    service.save_settings(
+        {
+            "activeVoiceId": "hero",
+            "voices": [
+                {
+                    "id": "hero",
+                    "name": "Hero",
+                    "gptWeights": "model-pack:voices/gpt/hero.ckpt",
+                    "sovitsWeights": "model-pack:voices/sovits/hero.pth",
+                    "referenceAudio": "model-pack:voices/audio/ref.wav",
+                    "promptText": "fixture",
+                }
+            ],
+        }
+    )
+    config_path = service._prepare_runtime_config(
+        service.get_settings(), service.get_settings()["voices"][0]
+    )
+    assert config_path is not None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["custom"]["t2s_weights_path"].endswith("voices\\gpt\\hero.ckpt")
+    assert config["custom"]["vits_weights_path"].endswith("voices\\sovits\\hero.pth")
+
+    install_runtime_pointer(paths)
+    processes: list[FakeProcess] = []
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        process = FakeProcess(command, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(service, "probe", lambda: {"available": False, "message": "offline"})
+    monkeypatch.setattr(service_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        service, "_terminate_process", lambda process: setattr(process, "returncode", 0)
+    )
+    launched = service.launch_runtime()
+    assert launched["running"] is True
+    assert processes[0].command[-2:] == ["-c", str(config_path)]
+    service.stop_runtime()
+
+    calls: list[str] = []
+
+    def fake_request(url: str, **_kwargs: object) -> bytes:
+        calls.append(url)
+        return b"RIFF-external"
+
+    monkeypatch.setattr(
+        service_module.TtsStudioService, "_request_bytes", staticmethod(fake_request)
+    )
+    generated = service.synthesize(
+        {
+            "providerId": PROVIDER_ID,
+            "voiceId": "hero",
+            "requestId": "external-model-pack",
+            "text": "fixture",
+        }
+    )
+    assert Path(generated["audio"]["path"]).read_bytes() == b"RIFF-external"
+    assert any("hero.ckpt" in call for call in calls)
+    assert any("hero.pth" in call for call in calls)
+
+    rebuilt = TtsStudioService()
+    initialize(rebuilt, tmp_path)
+    assert rebuilt.active_model_pack()["packId"] == "legacy-webui-models"
+    deactivated = rebuilt.deactivate_model_pack()
+    assert deactivated["active"] is None
+
+
 def test_synthesize_writes_managed_cache_and_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -397,6 +591,147 @@ def test_preview_over_limit_removes_cache_and_history(
 
     assert service.read_history() == []
     assert list((paths["cache"] / "audio").iterdir()) == []
+
+
+def test_readiness_classifies_missing_voice_configuration(tmp_path: Path) -> None:
+    service = TtsStudioService()
+    initialize(service, tmp_path)
+
+    result = service.readiness()
+
+    assert result["ready"] is False
+    assert result["status"] == "reference_audio_missing"
+    assert any(
+        item["id"] == "referenceAudio" and item["code"] == "reference_audio_missing"
+        for item in result["checks"]
+    )
+
+
+def test_runtime_smoke_waits_for_api_and_returns_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    install_runtime_pointer(paths)
+    (paths["assets"] / "voices" / "audio" / "hero.wav").write_bytes(b"RIFF-reference")
+    service.save_settings(
+        {
+            "apiUrl": "http://127.0.0.1:9880",
+            "activeVoiceId": "hero",
+            "voices": [
+                {
+                    "id": "hero",
+                    "name": "Hero",
+                    "referenceAudio": "voices/audio/hero.wav",
+                    "promptText": "fixture",
+                }
+            ],
+        }
+    )
+
+    with fake_gpt_sovits() as api_url:
+        service.save_settings({"apiUrl": api_url})
+        service.runtime_process = FakeProcess([])
+        result = service.runtime_smoke({"text": "你好", "autoLaunch": False})
+
+    assert result["ok"] is True
+    assert result["status"] == "ready"
+    assert base64.b64decode(result["audio"]["base64"]) == b"RIFF-http-generated"
+
+
+def test_external_api_is_ready_without_plugin_managed_runtime(tmp_path: Path) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    (paths["assets"] / "voices" / "audio" / "hero.wav").write_bytes(b"RIFF-reference")
+
+    with fake_gpt_sovits() as api_url:
+        service.save_settings(
+            {
+                "apiUrl": api_url,
+                "activeVoiceId": "hero",
+                "voices": [
+                    {
+                        "id": "hero",
+                        "name": "Hero",
+                        "referenceAudio": "voices/audio/hero.wav",
+                        "promptText": "fixture",
+                    }
+                ],
+            }
+        )
+        readiness = service.readiness()
+        result = service.runtime_smoke({"text": "你好", "autoLaunch": False})
+
+    assert readiness["ready"] is True
+    assert readiness["message"] == "external GPT-SoVITS API is ready"
+    assert readiness["runtime"]["managed"] is False
+    assert result["ok"] is True
+
+
+def test_runtime_smoke_reports_timeout_and_preserves_runtime_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    install_runtime_pointer(paths)
+    (paths["assets"] / "voices" / "audio" / "hero.wav").write_bytes(b"RIFF-reference")
+    service.save_settings(
+        {
+            "activeVoiceId": "hero",
+            "voices": [
+                {
+                    "id": "hero",
+                    "name": "Hero",
+                    "referenceAudio": "voices/audio/hero.wav",
+                    "promptText": "fixture",
+                }
+            ],
+        }
+    )
+    service.runtime_process = FakeProcess([])
+    service.runtime_log_path.write_text("boot failed\n", encoding="utf-8")
+    monkeypatch.setattr(service, "probe", lambda: {"available": False, "message": "API booting"})
+
+    clock = iter((0.0, 0.0, 2.0))
+    monkeypatch.setattr(service_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(service_module.time, "sleep", lambda _seconds: None)
+
+    result = service.runtime_smoke({"timeoutSeconds": 1, "autoLaunch": False})
+
+    assert result["ok"] is False
+    assert result["status"] == "api_not_ready"
+    assert "boot failed" in result["runtimeLog"]
+
+
+def test_readiness_classifies_runtime_port_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    install_runtime_pointer(paths)
+    (paths["assets"] / "voices" / "audio" / "hero.wav").write_bytes(b"RIFF-reference")
+    service.save_settings(
+        {
+            "activeVoiceId": "hero",
+            "voices": [
+                {
+                    "id": "hero",
+                    "name": "Hero",
+                    "referenceAudio": "voices/audio/hero.wav",
+                    "promptText": "fixture",
+                }
+            ],
+        }
+    )
+    service.runtime_process = FakeProcess([])
+    service.runtime_log_path.write_text("[Errno 10048] address already in use\n", encoding="utf-8")
+    monkeypatch.setattr(service, "probe", lambda: {"available": False, "message": "API offline"})
+
+    readiness = service.readiness()
+
+    assert readiness["ready"] is False
+    assert readiness["status"] == "api_port_conflict"
+    assert readiness["message"] == "GPT-SoVITS API port is already in use"
 
 
 def test_runtime_status_reads_validated_current_pointer_and_launches(
