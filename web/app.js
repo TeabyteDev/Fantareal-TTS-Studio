@@ -12,6 +12,7 @@
     modelPack: null,
     smokeRunning: false
   };
+  let previewObjectUrl = "";
   const $ = (selector) => document.querySelector(selector);
   const elements = {
     hostStatus: $("#hostStatus"),
@@ -26,6 +27,7 @@
     runtimeInstallStatus: $("#runtimeInstallStatus"),
     runtimeLog: $("#runtimeLog"),
     installRuntimeButton: $("#installRuntimeButton"),
+    installOnlineRuntimeButton: $("#installOnlineRuntimeButton"),
     cancelRuntimeButton: $("#cancelRuntimeButton"),
     launchRuntimeButton: $("#launchRuntimeButton"),
     stopRuntimeButton: $("#stopRuntimeButton"),
@@ -149,7 +151,7 @@
   function renderModelPack(modelPack) {
     const manifest = modelPack?.manifest;
     if (!manifest) {
-      elements.modelPackStatus.textContent = "尚未选择本地模型目录";
+      elements.modelPackStatus.textContent = "尚未选择完整 TTS 包";
       elements.modelPackSummary.hidden = true;
       elements.modelPackVoices.hidden = true;
       elements.modelPackSummary.replaceChildren();
@@ -160,7 +162,7 @@
     }
     const summary = manifest.summary || {};
     const roles = summary.roles || {};
-    const activeLabel = modelPack.active ? "已激活" : "已扫描，尚未激活";
+    const activeLabel = modelPack.active ? "正在使用" : "已扫描，尚未使用";
     elements.modelPackStatus.textContent = `${activeLabel} ${manifest.packId || "local-model-pack"} · ${manifest.version || "local"}`;
     elements.activateModelPackButton.disabled = Boolean(modelPack.active) || !modelPack.directoryToken;
     elements.deactivateModelPackButton.disabled = !modelPack.active;
@@ -171,7 +173,8 @@
       `<span>GPT ${Number(roles.gpt) || 0}</span>`,
       `<span>SoVITS ${Number(roles.sovits) || 0}</span>`,
       `<span>预训练 ${Number(roles.pretrained) || 0}</span>`,
-      `<span>参考音频 ${Number(roles.audio) || 0}</span>`
+      `<span>参考音频 ${Number(roles.audio) || 0}</span>`,
+      `<span>${manifest.runtime ? "GPT-SoVITS 完整" : "缺少 GPT-SoVITS runtime"}</span>`
     ].join("");
     const voices = manifest.voices || [];
     elements.modelPackVoices.hidden = false;
@@ -252,8 +255,10 @@
     if (install?.logTail) logs.push(`[INSTALL]\n${install.logTail}`);
     if (state.runtime?.logTail) logs.push(`[RUNTIME]\n${state.runtime.logTail}`);
     elements.runtimeLog.textContent = logs.join("\n\n") || "暂无日志";
-    elements.installRuntimeButton.disabled = running;
-    elements.installRuntimeButton.textContent = install?.installed ? "修复 / 重新安装" : "安装 runtime";
+    const completeBundle = Boolean(state.modelPack?.active && state.modelPack?.manifest?.runtime);
+    elements.installRuntimeButton.disabled = running || !completeBundle;
+    elements.installRuntimeButton.textContent = install?.installed ? "修复本机环境" : "配置本机环境";
+    elements.installOnlineRuntimeButton.disabled = running;
     elements.cancelRuntimeButton.disabled = !running;
     elements.runtimeDevice.disabled = running;
   }
@@ -287,10 +292,27 @@
     return readiness;
   }
 
-  function showAudio(audio) {
-    elements.previewAudio.src = `data:${audio.mediaType};base64,${audio.base64}`;
+  function releasePreviewAudio() {
+    if (!previewObjectUrl) return;
+    URL.revokeObjectURL(previewObjectUrl);
+    previewObjectUrl = "";
+  }
+
+  async function showAudio(audio) {
+    if (!audio?.base64) throw new Error("TTS 未返回可播放的音频数据");
+    const binary = atob(audio.base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    const blob = new Blob([bytes], { type: audio.mediaType || "audio/wav" });
+    elements.previewAudio.pause();
+    releasePreviewAudio();
+    previewObjectUrl = URL.createObjectURL(blob);
+    elements.previewAudio.src = previewObjectUrl;
+    elements.previewAudio.load();
     elements.previewAudio.hidden = false;
-    return elements.previewAudio.play().catch(() => {});
+    await elements.previewAudio.play();
   }
 
   async function loadState() {
@@ -304,7 +326,7 @@
       ? { ...result.modelPack, active: true, manifest: result.modelPack.manifest }
       : null;
     elements.apiUrl.value = state.settings.apiUrl;
-    elements.runtimeDevice.value = state.settings.runtimeDevice || "cpu";
+    elements.runtimeDevice.value = state.settings.runtimeDevice || "auto";
     renderVoices();
     renderHistory();
     renderModelPack(state.modelPack);
@@ -338,7 +360,7 @@
     }
     const selected = await host.pickDirectory();
     if (!selected) return;
-    elements.modelPackStatus.textContent = `正在扫描 ${selected.name || "本地模型目录"}…`;
+    elements.modelPackStatus.textContent = `正在扫描 ${selected.name || "完整 TTS 包"}…`;
     const result = await invoke("ttsStudio.inspectModelPack", {
       directoryToken: selected.directoryToken,
       packId: selected.name || "local-model-pack",
@@ -346,13 +368,15 @@
       computeSha256: false
     });
     state.modelPack = {
-      name: selected.name || "本地模型目录",
+      name: selected.name || "完整 TTS 包",
       directoryToken: selected.directoryToken,
       manifest: result.manifest,
       active: false
     };
     renderModelPack(state.modelPack);
-    showMessage("本地模型目录扫描完成；模型文件仍保留在原位置。 ");
+    showMessage(result.manifest.runtime
+      ? "完整 TTS 包扫描完成；GPT-SoVITS 和模型仍保留在原位置。"
+      : "目录中识别到模型，但缺少可用的 GPT-SoVITS runtime。", !result.manifest.runtime);
   }
 
   $("#saveButton").addEventListener("click", () => saveSettings().catch((error) => showMessage(error.message, true)));
@@ -377,8 +401,22 @@
   });
   elements.installRuntimeButton.addEventListener("click", async () => {
     try {
-      showMessage("runtime 安装已开始，可以留在此页查看进度，也可以取消。请勿强制关闭主程序。");
-      state.install = await invoke("ttsStudio.runtimeInstall", { device: elements.runtimeDevice.value });
+      showMessage("正在使用完整包配置当前电脑的 Python/PyTorch 环境；不会复制模型或重新下载 GPT-SoVITS。");
+      state.install = await invoke("ttsStudio.runtimeInstall", {
+        device: elements.runtimeDevice.value,
+        source: "local-bundle"
+      });
+      renderInstall(state.install);
+      scheduleRuntimePoll();
+    } catch (error) { showMessage(error.message, true); }
+  });
+  elements.installOnlineRuntimeButton.addEventListener("click", async () => {
+    try {
+      showMessage("正在执行备用在线安装，将下载 GPT-SoVITS 源码和 Python 依赖。");
+      state.install = await invoke("ttsStudio.runtimeInstall", {
+        device: elements.runtimeDevice.value,
+        source: "online"
+      });
       renderInstall(state.install);
       scheduleRuntimePoll();
     } catch (error) { showMessage(error.message, true); }
@@ -485,7 +523,10 @@
       state.modelPack = { ...result.active, active: true };
       renderModelPack(state.modelPack);
       renderVoices();
-      showMessage("模型包已激活；如已运行 runtime，请重新启动 API。 ");
+      renderInstall(state.install || {});
+      showMessage(result.active?.manifest?.runtime
+        ? "完整 TTS 包已启用；现在可以配置本机环境。"
+        : "模型包已启用，但其中没有可用的 GPT-SoVITS runtime。", !result.active?.manifest?.runtime);
     } catch (error) { showMessage(error.message, true); }
   });
   elements.deactivateModelPackButton.addEventListener("click", async () => {
@@ -495,6 +536,7 @@
       state.modelPack = null;
       renderModelPack(null);
       renderVoices();
+      renderInstall(state.install || {});
       showMessage("模型包已停用。 ");
     } catch (error) { showMessage(error.message, true); }
   });
@@ -505,6 +547,7 @@
   document.querySelectorAll("[data-import-kind]").forEach((button) => {
     button.addEventListener("click", () => importAsset(button.dataset.importKind).catch((error) => showMessage(error.message, true)));
   });
+  window.addEventListener("pagehide", releasePreviewAudio);
 
   if (host) {
     elements.hostStatus.textContent = "已连接宿主";

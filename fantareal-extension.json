@@ -3,7 +3,7 @@
   "id": "com.fantareal.tts-studio",
   "name": "TTS Studio",
   "description": "通过 GPT-SoVITS 为 Fantareal 原生聊天提供角色语音。",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "publisher": "cOkieeman",
   "compatibility": {
     "hostApi": ">=1.0.0 <2.0.0",

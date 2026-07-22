@@ -19,6 +19,12 @@ ROLE_SUFFIXES = {
     "pretrained": {".ckpt", ".pth", ".pt", ".bin", ".onnx"},
 }
 ROLES = frozenset(ROLE_SUFFIXES)
+LOCAL_RUNTIME_KIND = "gpt-sovits-local-runtime"
+LOCAL_RUNTIME_FILES = {
+    "entrypoint": "api_v2.py",
+    "requirements": "requirements.txt",
+    "extraRequirements": "extra-req.txt",
+}
 
 
 class ModelPackError(ValueError):
@@ -43,6 +49,11 @@ def _safe_relative_path(value: Any) -> str:
     return "/".join(part for part in path.parts if part not in ("", "."))
 
 
+def _safe_relative_directory(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    return "." if text == "." else _safe_relative_path(text)
+
+
 def _resolve_directory(root: Path | str) -> Path:
     candidate = Path(root).expanduser()
     if _is_link(candidate):
@@ -54,6 +65,46 @@ def _resolve_directory(root: Path | str) -> Path:
     if not resolved.is_dir():
         raise ModelPackError("model pack root must be a directory")
     return resolved
+
+
+def _normalize_runtime(
+    source_root: Path, raw: dict[str, Any] | None = None
+) -> dict[str, str] | None:
+    if raw is None:
+        candidates = ("runtime/GPT-SoVITS", "GPT-SoVITS", ".")
+        runtime_relative = next(
+            (
+                relative
+                for relative in candidates
+                if all(
+                    (source_root / relative / filename).is_file()
+                    for filename in LOCAL_RUNTIME_FILES.values()
+                )
+            ),
+            None,
+        )
+        if runtime_relative is None:
+            return None
+    else:
+        if raw.get("kind") != LOCAL_RUNTIME_KIND:
+            raise ModelPackError("model pack runtime kind is invalid")
+        runtime_relative = _safe_relative_directory(raw.get("root"))
+
+    runtime_root = (source_root / runtime_relative).resolve(strict=True)
+    try:
+        runtime_root.relative_to(source_root)
+    except ValueError:
+        raise ModelPackError("model pack runtime is outside the source root") from None
+    if _is_link(runtime_root) or not runtime_root.is_dir():
+        raise ModelPackError("model pack runtime root is not a regular directory")
+
+    descriptor = {"kind": LOCAL_RUNTIME_KIND, "root": runtime_relative}
+    for key, filename in LOCAL_RUNTIME_FILES.items():
+        path = runtime_root / filename
+        if _is_link(path) or not path.is_file():
+            raise ModelPackError(f"model pack runtime is missing {filename}")
+        descriptor[key] = filename if runtime_relative == "." else f"{runtime_relative}/{filename}"
+    return descriptor
 
 
 def _role_for(path: Path) -> str | None:
@@ -199,6 +250,12 @@ def validate_model_pack_manifest(
         "summary": {"fileCount": len(normalized_files), "bytes": total_bytes, "roles": role_counts},
         "voices": manifest.get("voices") if isinstance(manifest.get("voices"), list) else [],
     }
+    runtime = _normalize_runtime(
+        source_root,
+        manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else None,
+    )
+    if runtime is not None:
+        normalized["runtime"] = runtime
     return normalized
 
 
@@ -249,6 +306,9 @@ def scan_model_pack(
         "summary": {"fileCount": len(files), "bytes": total_bytes, "roles": role_counts},
         "voices": _voice_entries(files),
     }
+    runtime = _normalize_runtime(source_root)
+    if runtime is not None:
+        manifest["runtime"] = runtime
     return validate_model_pack_manifest(manifest, source_root, verify_hash=compute_sha256)
 
 

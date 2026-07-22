@@ -32,7 +32,7 @@ MAX_PREVIEW_TEXT_CHARS = 500
 MAX_PREVIEW_AUDIO_BYTES = 6 * 1024 * 1024
 MODEL_PACK_REFERENCE_PREFIX = "model-pack:"
 ACTIVE_MODEL_PACK_KIND = "fantareal.active-model-pack"
-RUNTIME_DEVICES = {"cpu", "cu126", "cu128"}
+RUNTIME_DEVICES = {"auto", "cpu", "cu126", "cu128"}
 AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
 ASSET_RULES = {
     "gpt": ({".ckpt"}, MAX_MODEL_BYTES),
@@ -71,7 +71,7 @@ DEFAULT_SETTINGS = {
     "sampleSteps": 32,
     "parallelInfer": True,
     "repetitionPenalty": 1.35,
-    "runtimeDevice": "cpu",
+    "runtimeDevice": "auto",
 }
 
 
@@ -141,6 +141,15 @@ def safe_filename(value: Any, fallback: str) -> str:
     name = Path(str(value or "")).name
     stem = re.sub(r"[^a-zA-Z0-9._ -]", "_", Path(name).stem).strip(" ._") or fallback
     return f"{stem[:120]}{Path(name).suffix.lower()}"
+
+
+def resolve_runtime_device(value: Any) -> str:
+    requested = str(value or "auto").strip().lower()
+    if requested not in RUNTIME_DEVICES:
+        requested = "auto"
+    if requested != "auto":
+        return requested
+    return "cu126" if shutil.which("nvidia-smi") else "cpu"
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -256,6 +265,7 @@ def model_pack_file(
 def sanitize_voice(raw: Any, index: int) -> dict[str, Any]:
     source = raw if isinstance(raw, dict) else {}
     voice_id = safe_id(source.get("id"), f"voice-{index + 1}")
+
     def sanitize_reference(value: Any) -> str:
         text = str(value or "").strip().replace("\\", "/")
         if text.startswith(MODEL_PACK_REFERENCE_PREFIX):
@@ -333,10 +343,10 @@ def sanitize_settings(raw: Any, existing: dict[str, Any] | None = None) -> dict[
             source.get("repetitionPenalty", base.get("repetitionPenalty")), 0.1, 2.0, 1.35
         ),
         "runtimeDevice": (
-            str(source.get("runtimeDevice", base.get("runtimeDevice", "cpu"))).lower()
-            if str(source.get("runtimeDevice", base.get("runtimeDevice", "cpu"))).lower()
+            str(source.get("runtimeDevice", base.get("runtimeDevice", "auto"))).lower()
+            if str(source.get("runtimeDevice", base.get("runtimeDevice", "auto"))).lower()
             in RUNTIME_DEVICES
-            else "cpu"
+            else "auto"
         ),
     }
 
@@ -705,9 +715,7 @@ class TtsStudioService:
             status = "ready"
             ready = True
             message = (
-                "TTS runtime is ready"
-                if pointer or running
-                else "external GPT-SoVITS API is ready"
+                "TTS runtime is ready" if pointer or running else "external GPT-SoVITS API is ready"
             )
         elif pointer is None:
             first_failure = next(item for item in checks if item["id"] == "runtimeInstalled")
@@ -762,10 +770,15 @@ class TtsStudioService:
         readiness = self.readiness()
         deadline = time.monotonic() + timeout_seconds
 
-        if not readiness["ready"] and auto_launch and readiness["status"] in {
-            "runtime_not_running",
-            "api_not_ready",
-        }:
+        if (
+            not readiness["ready"]
+            and auto_launch
+            and readiness["status"]
+            in {
+                "runtime_not_running",
+                "api_not_ready",
+            }
+        ):
             if not readiness["runtime"]["installed"]:
                 return {
                     "ok": False,
@@ -912,11 +925,27 @@ class TtsStudioService:
         if process is not None and process.poll() is None:
             return self.runtime_install_status()
         self.installer_process = None
-        device = str(params.get("device") or self.get_settings()["runtimeDevice"]).lower()
-        if device not in RUNTIME_DEVICES:
+        requested_device = str(params.get("device") or self.get_settings()["runtimeDevice"]).lower()
+        if requested_device not in RUNTIME_DEVICES:
             raise RpcFailure(-32602, "runtime device is invalid")
+        device = resolve_runtime_device(requested_device)
+        source_mode = str(params.get("source") or "local-bundle").strip().lower()
+        if source_mode not in {"local-bundle", "online"}:
+            raise RpcFailure(-32602, "runtime source is invalid")
+        runtime_root: Path | None = None
+        if source_mode == "local-bundle":
+            active = self.active_model_pack(required=True)
+            runtime = active["manifest"].get("runtime")
+            if not isinstance(runtime, dict):
+                raise RpcFailure(
+                    -32058,
+                    "active model pack does not contain a complete GPT-SoVITS runtime",
+                )
+            runtime_root = (Path(active["root"]) / str(runtime.get("root") or "")).resolve(
+                strict=True
+            )
         settings = self.get_settings()
-        settings["runtimeDevice"] = device
+        settings["runtimeDevice"] = requested_device
         self.save_settings(settings)
         self.stop_runtime()
         self._cleanup_runtime_staging()
@@ -937,6 +966,8 @@ class TtsStudioService:
             "--device",
             device,
         ]
+        if runtime_root is not None:
+            command.extend(["--source-runtime-root", str(runtime_root)])
         atomic_write_json(
             self.runtime_install_state_path,
             {
@@ -944,6 +975,9 @@ class TtsStudioService:
                 "step": "starting",
                 "progress": 0.0,
                 "device": device,
+                "requestedDevice": requested_device,
+                "sourceType": source_mode,
+                "runtimeRoot": str(runtime_root) if runtime_root else "",
                 "updatedAt": utc_now(),
                 "error": "",
             },
@@ -1065,6 +1099,9 @@ class TtsStudioService:
         environment = os.environ.copy()
         environment["PYTHONUTF8"] = "1"
         environment["PYTHONIOENCODING"] = "utf-8"
+        nltk_data = python_path.parent.parent / "nltk_data"
+        if nltk_data.is_dir():
+            environment["NLTK_DATA"] = str(nltk_data)
         try:
             with self.runtime_log_path.open("ab") as log_handle:
                 self.runtime_process = subprocess.Popen(
@@ -1107,7 +1144,13 @@ class TtsStudioService:
             raise RpcFailure(-32057, f"active model pack is missing pretrained directory: {name}")
 
         version = str(voice.get("modelVersion") or "v4")
-        device = "cuda" if settings["runtimeDevice"] in {"cu126", "cu128"} else "cpu"
+        installed = self._read_runtime_pointer()
+        runtime_device = (
+            str(installed.get("device") or "")
+            if installed
+            else resolve_runtime_device(settings["runtimeDevice"])
+        )
+        device = "cuda" if runtime_device in {"cu126", "cu128"} else "cpu"
         config = {
             "custom": {
                 "bert_base_path": str(find_directory("chinese-roberta-wwm-ext-large")),
@@ -1153,19 +1196,35 @@ class TtsStudioService:
         try:
             if not isinstance(pointer, dict):
                 raise ValueError
-            commit = str(pointer["commit"])
             runtime_root = Path(str(pointer["runtimeRoot"])).resolve(strict=True)
             python_path = Path(str(pointer["python"])).resolve(strict=True)
-            versions_root = (self._require_layout().assets / "runtime" / "versions").resolve(
-                strict=True
-            )
-            runtime_root.relative_to(versions_root)
-            python_path.relative_to(runtime_root.parent)
-            if runtime_root.parent.name != commit or not (runtime_root / "api_v2.py").is_file():
+            layout = self._require_layout()
+            if pointer.get("sourceType") == "local-bundle":
+                active = self.active_model_pack(required=True)
+                runtime = active["manifest"].get("runtime")
+                if not isinstance(runtime, dict):
+                    raise ValueError
+                expected_root = (Path(active["root"]) / str(runtime.get("root") or "")).resolve(
+                    strict=True
+                )
+                environments_root = (layout.assets / "runtime" / "environments").resolve(
+                    strict=True
+                )
+                if runtime_root != expected_root:
+                    raise ValueError
+                python_path.relative_to(environments_root)
+            else:
+                commit = str(pointer["commit"])
+                versions_root = (layout.assets / "runtime" / "versions").resolve(strict=True)
+                runtime_root.relative_to(versions_root)
+                python_path.relative_to(runtime_root.parent)
+                if runtime_root.parent.name != commit:
+                    raise ValueError
+            if not (runtime_root / "api_v2.py").is_file():
                 raise ValueError
             if not python_path.is_file():
                 raise ValueError
-        except (KeyError, OSError, TypeError, ValueError):
+        except (KeyError, OSError, TypeError, ValueError, RpcFailure):
             if required:
                 raise RpcFailure(-32047, "installed GPT-SoVITS runtime is unavailable") from None
             return None
@@ -1402,7 +1461,28 @@ class TtsStudioService:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = response.read(64 * 1024 * 1024 + 1)
-        except (OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                raw = exc.read(64 * 1024 + 1)
+                decoded = raw[: 64 * 1024].decode("utf-8", errors="replace")
+                parsed_error = json.loads(decoded)
+                if isinstance(parsed_error, dict):
+                    parts = [
+                        str(parsed_error.get(key) or "").strip()
+                        for key in ("message", "Exception", "detail")
+                    ]
+                    detail = ": ".join(part for part in parts if part)
+                else:
+                    detail = decoded.strip()
+            except (OSError, UnicodeError, ValueError):
+                detail = ""
+            suffix = f": {detail[:4000]}" if detail else ""
+            raise RpcFailure(
+                -32043,
+                f"GPT-SoVITS request failed: HTTP {exc.code} {exc.reason}{suffix}",
+            ) from exc
+        except (OSError, urllib.error.URLError) as exc:
             raise RpcFailure(-32043, f"GPT-SoVITS request failed: {exc}") from exc
         if len(payload) > 64 * 1024 * 1024:
             raise RpcFailure(-32043, "GPT-SoVITS response is too large")

@@ -382,7 +382,9 @@ def test_activate_model_pack_persists_external_references_and_runtime_config(
     assert config["custom"]["t2s_weights_path"].endswith("voices\\gpt\\hero.ckpt")
     assert config["custom"]["vits_weights_path"].endswith("voices\\sovits\\hero.pth")
 
-    install_runtime_pointer(paths)
+    pointer = install_runtime_pointer(paths)
+    nltk_data = Path(pointer["python"]).parent.parent / "nltk_data"
+    nltk_data.mkdir()
     processes: list[FakeProcess] = []
 
     def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
@@ -398,6 +400,7 @@ def test_activate_model_pack_persists_external_references_and_runtime_config(
     launched = service.launch_runtime()
     assert launched["running"] is True
     assert processes[0].command[-2:] == ["-c", str(config_path)]
+    assert processes[0].kwargs["env"]["NLTK_DATA"] == str(nltk_data)
     service.stop_runtime()
 
     calls: list[str] = []
@@ -426,6 +429,32 @@ def test_activate_model_pack_persists_external_references_and_runtime_config(
     assert rebuilt.active_model_pack()["packId"] == "legacy-webui-models"
     deactivated = rebuilt.deactivate_model_pack()
     assert deactivated["active"] is None
+
+
+def test_gpt_sovits_http_error_includes_backend_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = service_module.urllib.error.HTTPError(
+        "http://127.0.0.1:9880/tts",
+        400,
+        "Bad Request",
+        {},
+        io.BytesIO(b'{"message":"tts failed","Exception":"Resource cmudict not found"}'),
+    )
+    monkeypatch.setattr(
+        service_module.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(service_module.RpcFailure, match="Resource cmudict not found"):
+        TtsStudioService._request_bytes(
+            "http://127.0.0.1:9880/tts",
+            method="POST",
+            timeout=1,
+            body=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
 
 
 def test_synthesize_writes_managed_cache_and_history(
@@ -791,7 +820,7 @@ def test_runtime_install_starts_async_and_cancel_preserves_current(
         lambda process: setattr(process, "returncode", -1),
     )
 
-    started = service.runtime_install({"device": "cu126"})
+    started = service.runtime_install({"device": "cu126", "source": "online"})
 
     assert started["running"] is True
     assert processes[0].command[:6] == [
@@ -815,6 +844,110 @@ def test_runtime_install_starts_async_and_cancel_preserves_current(
     assert not new_staging.exists()
     assert current_path.read_bytes() == current_before
     assert cancelled["installed"]["runtimeRoot"] == pointer["runtimeRoot"]
+
+
+def test_runtime_install_uses_active_complete_bundle_and_auto_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    pack = tmp_path / "complete-tts-studio"
+    runtime = pack / "runtime" / "GPT-SoVITS"
+    voice_root = pack / "runtime" / "voices" / "gpt"
+    voice_root.mkdir(parents=True)
+    (voice_root / "hero.ckpt").write_bytes(b"gpt")
+    runtime.mkdir(parents=True)
+    for name in ("api_v2.py", "requirements.txt", "extra-req.txt"):
+        (runtime / name).write_text("# fixture\n", encoding="utf-8")
+    token = "12345678-1234-1234-1234-123456789abc"
+    grant_dir = paths["workspace"] / "input-directory-grants"
+    grant_dir.mkdir(parents=True)
+    (grant_dir / f"{token}.json").write_text(
+        json.dumps(
+            {
+                "kind": "fantareal.directory-grant",
+                "token": token,
+                "path": str(pack),
+                "readOnly": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    service.activate_model_pack({"directoryToken": token, "packId": "complete-pack"})
+    processes: list[FakeProcess] = []
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        process = FakeProcess(command, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(service_module.shutil, "which", lambda name: "nvidia-smi.exe")
+    monkeypatch.setattr(service_module.subprocess, "Popen", fake_popen)
+
+    started = service.runtime_install({"device": "auto"})
+
+    assert started["running"] is True
+    command = processes[0].command
+    assert command[command.index("--source-runtime-root") + 1] == str(runtime.resolve())
+    assert command[command.index("--device") + 1] == "cu126"
+    assert service.get_settings()["runtimeDevice"] == "auto"
+
+
+def test_runtime_pointer_accepts_only_active_local_bundle(
+    tmp_path: Path,
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    pack = tmp_path / "complete-tts-studio"
+    runtime = pack / "runtime" / "GPT-SoVITS"
+    voice_root = pack / "runtime" / "voices" / "gpt"
+    voice_root.mkdir(parents=True)
+    (voice_root / "hero.ckpt").write_bytes(b"gpt")
+    runtime.mkdir(parents=True)
+    for name in ("api_v2.py", "requirements.txt", "extra-req.txt"):
+        (runtime / name).write_text("# fixture\n", encoding="utf-8")
+    token = "12345678-1234-1234-1234-123456789abc"
+    grant_dir = paths["workspace"] / "input-directory-grants"
+    grant_dir.mkdir(parents=True)
+    (grant_dir / f"{token}.json").write_text(
+        json.dumps(
+            {
+                "kind": "fantareal.directory-grant",
+                "token": token,
+                "path": str(pack),
+                "readOnly": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    service.activate_model_pack({"directoryToken": token, "packId": "complete-pack"})
+    python = (
+        paths["assets"]
+        / "runtime"
+        / "environments"
+        / "fixture-cu126"
+        / "python"
+        / "Scripts"
+        / "python.exe"
+    )
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"fixture-python")
+    pointer = {
+        "version": "local-bundle",
+        "commit": "",
+        "sourceType": "local-bundle",
+        "runtimeKey": "fixture",
+        "runtimeRoot": str(runtime),
+        "python": str(python),
+        "device": "cu126",
+    }
+    current = paths["assets"] / "runtime" / "current.json"
+    current.write_text(json.dumps(pointer), encoding="utf-8")
+
+    assert service.runtime_status()["installed"]["sourceType"] == "local-bundle"
+
+    service.active_model_pack_path.unlink()
+    assert service.runtime_status()["installed"] is None
 
 
 def test_line_protocol_initialize_and_shutdown(tmp_path: Path) -> None:
