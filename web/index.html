@@ -20,7 +20,25 @@
       <div id="message" class="message" hidden></div>
 
       <section class="grid">
-        <article class="panel">
+        <article class="panel full">
+          <div class="sectionHead">
+            <div>
+              <p class="eyebrow">COMPLETE TTS PACKAGE</p>
+              <h2>完整本地 TTS 包</h2>
+            </div>
+            <div class="buttonRow modelPackActions">
+              <button id="pickModelPackButton" class="primary" type="button">选择完整包目录</button>
+              <button id="activateModelPackButton" type="button" disabled>使用这个包</button>
+              <button id="deactivateModelPackButton" type="button" disabled>停用</button>
+            </div>
+          </div>
+          <div id="modelPackStatus" class="statusBox">尚未选择完整 TTS 包</div>
+          <div id="modelPackSummary" class="modelPackSummary" hidden></div>
+          <div id="modelPackVoices" class="modelPackVoices" hidden></div>
+          <p class="hint">选择包含 `runtime/GPT-SoVITS` 与 `runtime/voices` 的完整目录。插件只读取原目录，不复制 GPT-SoVITS 和模型。</p>
+        </article>
+
+        <article class="panel full">
           <div class="sectionHead">
             <div>
               <p class="eyebrow">PROVIDER</p>
@@ -40,7 +58,7 @@
           </div>
         </article>
 
-        <article class="panel">
+        <article class="panel full">
           <div class="sectionHead">
             <div>
               <p class="eyebrow">RUNTIME</p>
@@ -48,12 +66,7 @@
             </div>
             <button id="runtimeButton" class="secondary" type="button">刷新</button>
           </div>
-          <label for="runtimeDevice">算力版本</label>
-          <select id="runtimeDevice">
-            <option value="cpu">CPU（通用，约需 15 GiB 空间）</option>
-            <option value="cu126">NVIDIA CUDA 12.6（约需 25 GiB 空间）</option>
-            <option value="cu128">NVIDIA CUDA 12.8（约需 25 GiB 空间）</option>
-          </select>
+          <p class="hint">默认自动识别：检测到 NVIDIA 时使用 CUDA 12.6，否则使用 CPU。</p>
           <div id="runtimeStatus" class="statusBox">读取中</div>
           <progress id="runtimeProgress" max="1" value="0"></progress>
           <div id="runtimeReadiness" class="statusLine">TTS readiness pending</div>
@@ -61,7 +74,7 @@
           <div class="buttonRow runtimeActions">
             <button id="checkReadinessButton" class="secondary" type="button">Readiness check</button>
             <button id="runtimeSmokeButton" class="primary" type="button">Sound smoke test</button>
-            <button id="installRuntimeButton" class="primary" type="button">安装 runtime</button>
+            <button id="installRuntimeButton" class="primary" type="button" disabled>配置本机环境</button>
             <button id="cancelRuntimeButton" type="button" disabled>取消安装</button>
             <button id="launchRuntimeButton" type="button">启动 API</button>
             <button id="stopRuntimeButton" type="button">停止 API</button>
@@ -70,7 +83,19 @@
             <summary>安装 / 运行日志</summary>
             <pre id="runtimeLog">暂无日志</pre>
           </details>
-          <p class="hint">runtime 固定到已审核的 GPT-SoVITS commit；安装失败或取消不会覆盖当前可用版本。</p>
+          <details class="advancedRuntime">
+            <summary>高级设置与在线修复</summary>
+            <label for="runtimeDevice">算力版本</label>
+            <select id="runtimeDevice">
+              <option value="auto">自动（推荐）</option>
+              <option value="cpu">强制 CPU</option>
+              <option value="cu126">强制 NVIDIA CUDA 12.6</option>
+              <option value="cu128">强制 NVIDIA CUDA 12.8</option>
+            </select>
+            <button id="installOnlineRuntimeButton" type="button">在线下载 GPT-SoVITS（备用）</button>
+            <p class="hint">只有完整包缺失或损坏时才使用在线下载；该操作会重新下载源码与依赖。</p>
+          </details>
+          <p class="hint">环境配置只创建当前电脑专用的 Python/PyTorch 环境，不复制完整包和模型。</p>
         </article>
 
         <article class="panel full">
@@ -102,24 +127,6 @@
             <button id="discoverButton" type="button">重新扫描</button>
           </div>
           <div id="voiceList" class="voiceList"></div>
-        </article>
-
-        <article class="panel full">
-          <div class="sectionHead">
-            <div>
-              <p class="eyebrow">MODEL PACK</p>
-              <h2>本地模型包</h2>
-            </div>
-            <div class="buttonRow modelPackActions">
-              <button id="pickModelPackButton" class="primary" type="button">选择模型目录</button>
-              <button id="activateModelPackButton" type="button" disabled>激活模型包</button>
-              <button id="deactivateModelPackButton" type="button" disabled>停用模型包</button>
-            </div>
-          </div>
-          <div id="modelPackStatus" class="statusBox">尚未选择本地模型目录</div>
-          <div id="modelPackSummary" class="modelPackSummary" hidden></div>
-          <div id="modelPackVoices" class="modelPackVoices" hidden></div>
-          <p class="hint">宿主只授予当前会话的只读目录 token，不会复制模型文件。GPT/SoVITS 权重与参考音频不会按文件名强制绑定，请在声线资产中显式选择。</p>
         </article>
 
         <article class="panel full">

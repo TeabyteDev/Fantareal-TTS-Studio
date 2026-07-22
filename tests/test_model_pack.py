@@ -51,6 +51,23 @@ def test_scan_model_pack_discovers_roles_and_voice(tmp_path: Path) -> None:
     ]
 
 
+def test_scan_model_pack_discovers_complete_local_runtime(tmp_path: Path) -> None:
+    write_fixture_pack(tmp_path)
+    runtime = tmp_path / "runtime" / "GPT-SoVITS"
+    for name in ("api_v2.py", "requirements.txt", "extra-req.txt"):
+        (runtime / name).write_text("# fixture\n", encoding="utf-8")
+
+    manifest = scan_model_pack(tmp_path)
+
+    assert manifest["runtime"] == {
+        "kind": "gpt-sovits-local-runtime",
+        "root": "runtime/GPT-SoVITS",
+        "entrypoint": "runtime/GPT-SoVITS/api_v2.py",
+        "requirements": "runtime/GPT-SoVITS/requirements.txt",
+        "extraRequirements": "runtime/GPT-SoVITS/extra-req.txt",
+    }
+
+
 def test_scan_model_pack_can_include_sha256(tmp_path: Path) -> None:
     write_fixture_pack(tmp_path)
 

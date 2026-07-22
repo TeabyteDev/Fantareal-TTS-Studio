@@ -69,6 +69,9 @@ progress { width: 100%; height: 9px; margin-top: 14px; accent-color: var(--accen
 .runtimeLog { margin-top: 14px; color: var(--muted); font-size: 12px; }
 .runtimeLog summary { cursor: pointer; }
 .runtimeLog pre { max-height: 220px; margin: 10px 0 0; padding: 12px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 12px; background: rgba(0, 0, 0, 0.22); }
+.advancedRuntime { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; }
+.advancedRuntime summary { cursor: pointer; color: var(--muted); }
+.advancedRuntime select, .advancedRuntime button { margin-top: 10px; }
 .previewAudio { width: 100%; margin-top: 14px; }
 
 @media (max-width: 800px) {
