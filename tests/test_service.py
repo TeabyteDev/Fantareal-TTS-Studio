@@ -3,7 +3,11 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,8 +16,9 @@ from pathlib import Path
 import pytest
 
 from fantareal_tts_studio import service as service_module
-from fantareal_tts_studio.runtime_installer import RUNTIME_COMMIT
+from fantareal_tts_studio.runtime_installer import RUNTIME_COMMIT, InstallerConfig, RuntimeInstaller
 from fantareal_tts_studio.service import PROVIDER_ID, TtsStudioService, handle_request, run
+from fantareal_tts_studio.supervision import InterprocessFileLock, probe_windows_owner_endpoint
 
 
 class FakeProcess:
@@ -359,6 +364,27 @@ def test_activate_model_pack_persists_external_references_and_runtime_config(
     assert activated is not None
     assert activated["result"]["active"]["packId"] == "legacy-webui-models"
     assert "model-pack:voices/gpt/hero.ckpt" in activated["result"]["assets"]["gpt"]
+    readiness = service.readiness()
+    checks = {item["id"]: item for item in readiness["checks"]}
+    assert checks["gptWeights"] == {
+        "id": "gptWeights",
+        "ok": False,
+        "code": "gpt_weights_missing",
+        "message": "active voice GPT weights are not configured",
+    }
+    assert checks["sovitsWeights"] == {
+        "id": "sovitsWeights",
+        "ok": False,
+        "code": "sovits_weights_missing",
+        "message": "active voice SoVITS weights are not configured",
+    }
+    with pytest.raises(
+        service_module.RpcFailure, match="active voice GPT weights are not configured"
+    ) as exc:
+        service._prepare_runtime_config(
+            service.get_settings(), service.get_settings()["voices"][0]
+        )
+    assert exc.value.code == -32058
     service.save_settings(
         {
             "activeVoiceId": "hero",
@@ -803,6 +829,7 @@ def test_runtime_install_starts_async_and_cancel_preserves_current(
     pointer = install_runtime_pointer(paths)
     current_path = paths["assets"] / "runtime" / "current.json"
     current_before = current_path.read_bytes()
+    service.runtime_install_log_path.write_text("previous install log\n", encoding="utf-8")
     staging = paths["assets"] / "runtime" / ".staging-fixture"
     staging.mkdir()
     processes: list[FakeProcess] = []
@@ -814,12 +841,12 @@ def test_runtime_install_starts_async_and_cancel_preserves_current(
 
     monkeypatch.setattr(service, "probe", lambda: {"available": False, "message": "offline"})
     monkeypatch.setattr(service_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(service, "_wait_for_runtime_install_handoff", lambda *_args: True)
     monkeypatch.setattr(
         service,
-        "_terminate_process",
-        lambda process: setattr(process, "returncode", -1),
+        "_runtime_install_owner_alive",
+        lambda state: bool(state.get("installId")),
     )
-
     started = service.runtime_install({"device": "cu126", "source": "online"})
 
     assert started["running"] is True
@@ -831,19 +858,605 @@ def test_runtime_install_starts_async_and_cancel_preserves_current(
         "-m",
         "fantareal_tts_studio.runtime_installer",
     ]
-    assert processes[0].command[-2:] == ["--device", "cu126"]
+    assert processes[0].command[-4:-2] == ["--device", "cu126"]
+    assert processes[0].command[-2] == "--install-id"
+    assert processes[0].command[-1] == started["installId"]
     assert service.get_settings()["runtimeDevice"] == "cu126"
-    assert not staging.exists()
+    assert staging.is_dir()
+    install_log = service.runtime_install_log_path.read_text(encoding="utf-8")
+    assert install_log.startswith("previous install log\n")
+    assert f"runtime install {started['installId']} started" in install_log
 
     new_staging = paths["assets"] / "runtime" / ".staging-running"
     new_staging.mkdir()
     cancelled = service.cancel_runtime_install()
 
-    assert cancelled["status"] == "cancelled"
-    assert cancelled["running"] is False
-    assert not new_staging.exists()
+    assert cancelled["status"] == "cancelling"
+    assert cancelled["running"] is True
+    assert cancelled["cancelRequested"] is True
+    assert processes[0].poll() is None
+    assert new_staging.is_dir()
+    control = json.loads(
+        service.runtime_install_control_path(started["installId"]).read_text(encoding="utf-8")
+    )
+    assert control["installId"] == started["installId"]
     assert current_path.read_bytes() == current_before
     assert cancelled["installed"]["runtimeRoot"] == pointer["runtimeRoot"]
+
+
+def test_extension_shutdown_does_not_cancel_runtime_install(tmp_path: Path) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    process = FakeProcess(["runtime-installer"])
+    service.installer_process = process
+    install_id = "a" * 32
+    state = {
+        "status": "running",
+        "step": "installing_torch",
+        "progress": 0.62,
+        "installId": install_id,
+        "pid": process.pid,
+        "startedAt": service_module.utc_now(),
+        "heartbeatAt": service_module.utc_now(),
+        "lastOutputAt": service_module.utc_now(),
+        "stagingRoot": str(paths["assets"] / "runtime" / f".staging-{install_id}"),
+        "updatedAt": service_module.utc_now(),
+        "error": "",
+    }
+    service_module.atomic_write_json(service.runtime_install_state_path, state)
+
+    result = service.dispatch("extension.shutdown", {})
+
+    assert result == {"stopping": True}
+    assert process.poll() is None
+    assert service.installer_process is process
+    assert not service.runtime_install_control_path(install_id).exists()
+
+
+def test_install_handoff_accepts_terminal_state_from_fast_installer(tmp_path: Path) -> None:
+    service = TtsStudioService()
+    initialize(service, tmp_path)
+    install_id = "6" * 32
+    now = service_module.utc_now()
+    process = FakeProcess(["runtime-installer"])
+    process.returncode = 0
+    service_module.atomic_write_json(
+        service.runtime_install_state_path,
+        {
+            "status": "completed",
+            "step": "completed",
+            "progress": 1.0,
+            "installId": install_id,
+            "ownerProtocolVersion": 1,
+            "ownerAcquiredAt": now,
+            "pid": process.pid,
+            "startedAt": now,
+            "heartbeatAt": now,
+            "lastOutputAt": now,
+            "updatedAt": now,
+            "error": "",
+        },
+    )
+
+    assert service._wait_for_runtime_install_handoff(process, install_id, timeout=0.1) is True
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    ["completed", "failed", "cancelled", "interrupted"],
+)
+def test_terminal_install_state_remains_authoritative_until_local_process_exits(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    service = TtsStudioService()
+    initialize(service, tmp_path)
+    install_id = "7" * 32
+    now = service_module.utc_now()
+    process = FakeProcess(["runtime-installer"])
+    service.installer_process = process
+    terminal_state = {
+        "status": terminal_status,
+        "step": terminal_status,
+        "progress": 1.0 if terminal_status == "completed" else 0.0,
+        "installId": install_id,
+        "ownerProtocolVersion": 1,
+        "ownerPid": process.pid,
+        "ownerAcquiredAt": now,
+        "pid": process.pid,
+        "startedAt": now,
+        "heartbeatAt": now,
+        "lastOutputAt": now,
+        "updatedAt": now,
+        "error": "fixture terminal state",
+    }
+    service_module.atomic_write_json(service.runtime_install_state_path, terminal_state)
+
+    before_exit = service.runtime_install_status()
+    cancelled = service.cancel_runtime_install()
+    after_cancel = json.loads(service.runtime_install_state_path.read_text(encoding="utf-8"))
+    control_exists = service.runtime_install_control_path(install_id).exists()
+    process_retained_before_exit = service.installer_process is process
+    process.returncode = 0
+    after_exit = service.runtime_install_status()
+    persisted_after_exit = json.loads(
+        service.runtime_install_state_path.read_text(encoding="utf-8")
+    )
+
+    assert (
+        before_exit["running"],
+        cancelled["running"],
+        cancelled["status"],
+        control_exists,
+        after_cancel,
+        process_retained_before_exit,
+        after_exit["status"],
+        persisted_after_exit,
+        service.installer_process,
+    ) == (
+        False,
+        False,
+        terminal_status,
+        False,
+        terminal_state,
+        True,
+        terminal_status,
+        terminal_state,
+        None,
+    )
+
+
+def test_rebuilt_service_recognizes_fresh_external_install_and_blocks_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = TtsStudioService()
+    initialize(original, tmp_path)
+    install_id = "b" * 32
+    state = {
+        "status": "running",
+        "step": "installing_torch",
+        "progress": 0.62,
+        "installId": install_id,
+        "pid": 9876,
+        "startedAt": service_module.utc_now(),
+        "heartbeatAt": service_module.utc_now(),
+        "lastOutputAt": service_module.utc_now(),
+        "stagingRoot": str(
+            original._require_layout().assets / "runtime" / f".staging-{install_id}"
+        ),
+        "updatedAt": service_module.utc_now(),
+        "error": "",
+    }
+    service_module.atomic_write_json(original.runtime_install_state_path, state)
+    rebuilt = TtsStudioService()
+    rebuilt.layout = original.layout
+    monkeypatch.setattr(
+        service_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("a duplicate installer must not start"),
+    )
+
+    status = rebuilt.runtime_install_status()
+    duplicate = rebuilt.runtime_install({"device": "cpu", "source": "online"})
+
+    assert status["running"] is True
+    assert status["external"] is True
+    assert status["installId"] == install_id
+    assert duplicate["installId"] == install_id
+
+
+def test_stale_external_install_becomes_interrupted_without_deleting_staging(
+    tmp_path: Path,
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    install_id = "c" * 32
+    staging = paths["assets"] / "runtime" / f".staging-{install_id}"
+    staging.mkdir()
+    service_module.atomic_write_json(
+        service.runtime_install_state_path,
+        {
+            "status": "running",
+            "step": "installing_torch",
+            "progress": 0.62,
+            "installId": install_id,
+            "pid": 1234,
+            "startedAt": "2000-01-01T00:00:00Z",
+            "heartbeatAt": "2000-01-01T00:00:00Z",
+            "lastOutputAt": "2000-01-01T00:00:00Z",
+            "stagingRoot": str(staging),
+            "updatedAt": "2000-01-01T00:00:00Z",
+            "error": "",
+        },
+    )
+
+    status = service.runtime_install_status()
+
+    assert status["status"] == "interrupted"
+    assert status["running"] is False
+    assert status["external"] is False
+    assert staging.is_dir()
+
+
+def test_rebuilt_service_requests_install_id_bound_cooperative_cancel(tmp_path: Path) -> None:
+    service = TtsStudioService()
+    initialize(service, tmp_path)
+    install_id = "d" * 32
+    service_module.atomic_write_json(
+        service.runtime_install_state_path,
+        {
+            "status": "running",
+            "step": "installing_torch",
+            "progress": 0.62,
+            "installId": install_id,
+            "pid": 2345,
+            "startedAt": service_module.utc_now(),
+            "heartbeatAt": service_module.utc_now(),
+            "lastOutputAt": service_module.utc_now(),
+            "stagingRoot": str(
+                service._require_layout().assets / "runtime" / f".staging-{install_id}"
+            ),
+            "updatedAt": service_module.utc_now(),
+            "error": "",
+        },
+    )
+
+    status = service.cancel_runtime_install()
+
+    control = json.loads(
+        service.runtime_install_control_path(install_id).read_text(encoding="utf-8")
+    )
+    assert control["installId"] == install_id
+    assert status["running"] is True
+    assert status["external"] is True
+    assert status["cancelRequested"] is True
+
+
+def test_concurrent_services_share_one_runtime_install_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = TtsStudioService()
+    paths = initialize(first, tmp_path)
+    second = TtsStudioService()
+    second.layout = first.layout
+    services = [first, second]
+    status_barrier = threading.Barrier(2)
+    real_status = TtsStudioService.runtime_install_status
+    status_calls: dict[int, int] = {}
+    status_calls_lock = threading.Lock()
+    real_atomic_write = service_module.atomic_write_json
+    state_write_lock = threading.Lock()
+    popen_commands: list[list[str]] = []
+    popen_lock = threading.Lock()
+
+    def synchronized_initial_status(service: TtsStudioService) -> dict:
+        status = real_status(service)
+        with status_calls_lock:
+            count = status_calls.get(id(service), 0)
+            status_calls[id(service)] = count + 1
+        if count == 0:
+            status_barrier.wait(timeout=5)
+        return status
+
+    def serialized_atomic_write(path: Path, value: object) -> None:
+        with state_write_lock:
+            real_atomic_write(path, value)
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        del kwargs
+        with popen_lock:
+            popen_commands.append(command)
+        return FakeProcess(command)
+
+    monkeypatch.setattr(TtsStudioService, "runtime_install_status", synchronized_initial_status)
+    monkeypatch.setattr(service_module, "atomic_write_json", serialized_atomic_write)
+    monkeypatch.setattr(service_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        TtsStudioService,
+        "_wait_for_runtime_install_handoff",
+        lambda *_args, **_kwargs: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        TtsStudioService,
+        "_runtime_install_owner_alive",
+        lambda _service, state: bool(state.get("installId")),
+        raising=False,
+    )
+    for service in services:
+        monkeypatch.setattr(service, "save_settings", lambda settings: settings)
+        monkeypatch.setattr(service, "stop_runtime", lambda: {})
+
+    results: list[dict | None] = [None, None]
+    errors: list[BaseException] = []
+
+    def launch(index: int) -> None:
+        try:
+            results[index] = services[index].runtime_install(
+                {"device": "cpu", "source": "online"}
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    workers = [threading.Thread(target=launch, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(popen_commands) == 1
+    assert results[0] is not None and results[1] is not None
+    assert results[0]["installId"] == results[1]["installId"]
+    assert (paths["data"] / "runtime-install-state.json").is_file()
+
+
+def test_installer_heartbeat_cannot_overwrite_cancelling_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = TtsStudioService()
+    paths = initialize(service, tmp_path)
+    install_id = "3" * 32
+    now = service_module.utc_now()
+    state = {
+        "status": "running",
+        "step": "installing_torch",
+        "progress": 0.62,
+        "installId": install_id,
+        "pid": 3456,
+        "startedAt": now,
+        "heartbeatAt": now,
+        "lastOutputAt": now,
+        "stagingRoot": str(paths["assets"] / "runtime" / f".staging-{install_id}"),
+        "updatedAt": now,
+        "error": "",
+    }
+    service_module.atomic_write_json(service.runtime_install_state_path, state)
+    config = InstallerConfig(
+        assets_root=paths["assets"],
+        data_root=paths["data"],
+        cache_root=paths["cache"],
+        device="cpu",
+        install_id=install_id,
+    )
+    installer = RuntimeInstaller(config)
+    installer._state = state.copy()
+    installer.started_at = now
+    installer.last_output_at = now
+    installer.staging_root = config.staging_root
+    monkeypatch.setattr(
+        TtsStudioService,
+        "_runtime_install_owner_alive",
+        lambda _service, current: current.get("installId") == install_id,
+        raising=False,
+    )
+
+    service.cancel_runtime_install()
+    installer._touch_heartbeat()
+    status = service.runtime_install_status()
+    persisted = json.loads(service.runtime_install_state_path.read_text(encoding="utf-8"))
+
+    assert status["status"] == "cancelling"
+    assert status["step"] == "cancelling"
+    assert status["cancelRequested"] is True
+    assert persisted["status"] == "cancelling"
+    assert persisted["step"] == "cancelling"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows owner identity regression")
+def test_owner_lock_holder_must_match_the_declared_owner_process(
+    tmp_path: Path,
+) -> None:
+    service = TtsStudioService()
+    initialize(service, tmp_path)
+    install_id = "5" * 32
+    ready = tmp_path / "owner-lock-ready"
+    source_root = str(Path(__file__).parents[1] / "src")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = source_root
+    holder_script = (
+        "import sys, time; from pathlib import Path; "
+        "from fantareal_tts_studio.supervision import InterprocessFileLock; "
+        "lock=InterprocessFileLock(Path(sys.argv[1])); lock.acquire(); "
+        "Path(sys.argv[2]).write_text('ready'); time.sleep(30)"
+    )
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            holder_script,
+            str(service.runtime_install_owner_lock_path),
+            str(ready),
+        ],
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    deadline = time.monotonic() + 10.0
+    while not ready.is_file() and holder.poll() is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    assert holder.poll() is None
+    declared_pid = holder.pid + 1_000_000
+    state = {
+        "status": "running",
+        "step": "installing_torch",
+        "progress": 0.62,
+        "installId": install_id,
+        "ownerProtocolVersion": 1,
+        "ownerPid": declared_pid,
+        "ownerAcquiredAt": "2000-01-01T00:00:00Z",
+        "pid": declared_pid,
+        "startedAt": "2000-01-01T00:00:00Z",
+        "heartbeatAt": "2000-01-01T00:00:00Z",
+        "lastOutputAt": "2000-01-01T00:00:00Z",
+        "stagingRoot": str(
+            service._require_layout().assets / "runtime" / f".staging-{install_id}"
+        ),
+        "updatedAt": "2000-01-01T00:00:00Z",
+        "error": "",
+    }
+    service_module.atomic_write_json(service.runtime_install_state_path, state)
+    service_module.atomic_write_json(
+        service.runtime_install_owner_metadata_path,
+        {
+            "installId": install_id,
+            "pid": declared_pid,
+            "acquiredAt": state["ownerAcquiredAt"],
+        },
+    )
+    try:
+        status = service.runtime_install_status()
+        assert status["ownerLockHeld"] is True
+        assert status["ownerAlive"] is False
+        assert status["ownerConflict"] is True
+        assert status["external"] is False
+        assert status["running"] is False
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows owner identity regression")
+def test_named_pipe_owner_endpoint_authenticates_the_actual_child_process(
+    tmp_path: Path,
+) -> None:
+    service = TtsStudioService()
+    initialize(service, tmp_path)
+    install_id = "6" * 32
+    token = "7" * 64
+    acquired_at = "2000-01-01T00:00:00Z"
+    ready = tmp_path / "owner-endpoint-ready"
+    source_root = str(Path(__file__).parents[1] / "src")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = source_root
+    owner_script = (
+        "import os, sys, time; from pathlib import Path; "
+        "from fantareal_tts_studio.supervision import WindowsOwnerEndpoint; "
+        "endpoint=WindowsOwnerEndpoint(Path(sys.argv[1]), install_id=sys.argv[2], "
+        "owner_token=sys.argv[3]); endpoint.start(); "
+        "Path(sys.argv[4]).write_text(str(os.getpid())); time.sleep(30)"
+    )
+    owner = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            owner_script,
+            str(service._require_layout().data),
+            install_id,
+            token,
+            str(ready),
+        ],
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        deadline = time.monotonic() + 10.0
+        while not ready.is_file() and owner.poll() is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert owner.poll() is None
+        actual_owner_pid = int(ready.read_text(encoding="utf-8"))
+        state = {
+            "status": "running",
+            "step": "installing_torch",
+            "progress": 0.62,
+            "installId": install_id,
+            "ownerProtocolVersion": 2,
+            "ownerPid": actual_owner_pid,
+            "ownerAcquiredAt": acquired_at,
+            "ownerToken": token,
+            "pid": actual_owner_pid,
+            "startedAt": acquired_at,
+            "heartbeatAt": "2000-01-01T00:00:00Z",
+            "lastOutputAt": "2000-01-01T00:00:00Z",
+            "updatedAt": "2000-01-01T00:00:00Z",
+            "error": "",
+        }
+        service_module.atomic_write_json(service.runtime_install_state_path, state)
+        service_module.atomic_write_json(
+            service.runtime_install_owner_metadata_path,
+            {
+                "ownerProtocolVersion": 2,
+                "installId": install_id,
+                "pid": actual_owner_pid,
+                "acquiredAt": acquired_at,
+                "ownerToken": token,
+            },
+        )
+
+        direct_probe = probe_windows_owner_endpoint(service._require_layout().data)
+        assert direct_probe.status == "verified"
+        assert direct_probe.actual_pid == actual_owner_pid
+        assert direct_probe.identity is not None
+        assert direct_probe.identity.get("ownerToken") == token
+
+        status = service.runtime_install_status()
+
+        assert status["ownerAlive"] is True
+        assert status["ownerConflict"] is False
+        assert status["external"] is True
+        assert status["running"] is True
+        assert status["pid"] == actual_owner_pid
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("state_identity", "metadata_identity"),
+    [
+        ({"ownerPid": 4567}, {"pid": 7654}),
+        (
+            {"ownerAcquiredAt": "2000-01-01T00:00:00Z"},
+            {"acquiredAt": "2000-01-01T00:00:01Z"},
+        ),
+    ],
+    ids=["pid-mismatch", "acquired-at-mismatch"],
+)
+def test_owner_lock_does_not_validate_mismatched_owner_identity(
+    tmp_path: Path,
+    state_identity: dict[str, object],
+    metadata_identity: dict[str, object],
+) -> None:
+    service = TtsStudioService()
+    initialize(service, tmp_path)
+    install_id = "8" * 32
+    state = {
+        "status": "running",
+        "step": "installing_torch",
+        "progress": 0.62,
+        "installId": install_id,
+        "ownerProtocolVersion": 1,
+        "ownerPid": 4567,
+        "ownerAcquiredAt": "2000-01-01T00:00:00Z",
+        "pid": 4567,
+        "startedAt": "2000-01-01T00:00:00Z",
+        "heartbeatAt": "2000-01-01T00:00:00Z",
+        "lastOutputAt": "2000-01-01T00:00:00Z",
+        "updatedAt": "2000-01-01T00:00:00Z",
+        "error": "",
+        **state_identity,
+    }
+    owner = {
+        "installId": install_id,
+        "pid": 4567,
+        "acquiredAt": "2000-01-01T00:00:00Z",
+        **metadata_identity,
+    }
+    service_module.atomic_write_json(service.runtime_install_state_path, state)
+    service_module.atomic_write_json(service.runtime_install_owner_metadata_path, owner)
+
+    with InterprocessFileLock(service.runtime_install_owner_lock_path):
+        status = service.runtime_install_status()
+
+    assert status["ownerLockHeld"] is True
+    assert status["ownerAlive"] is False
+    assert status["ownerConflict"] is True
+    assert status["external"] is False
+    assert status["running"] is False
 
 
 def test_runtime_install_uses_active_complete_bundle_and_auto_cuda(
@@ -883,6 +1496,12 @@ def test_runtime_install_uses_active_complete_bundle_and_auto_cuda(
 
     monkeypatch.setattr(service_module.shutil, "which", lambda name: "nvidia-smi.exe")
     monkeypatch.setattr(service_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(service, "_wait_for_runtime_install_handoff", lambda *_args: True)
+    monkeypatch.setattr(
+        service,
+        "_runtime_install_owner_alive",
+        lambda state: bool(state.get("installId")),
+    )
 
     started = service.runtime_install({"device": "auto"})
 

@@ -5,20 +5,34 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 import venv
 import zipfile
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from .supervision import (
+    InterprocessFileLock,
+    LockUnavailable,
+    WindowsKillOnCloseJob,
+    WindowsOwnerEndpoint,
+    replace_file_with_retry,
+    terminate_windows_process_tree,
+)
 
 RUNTIME_VERSION = "20250606v2pro"
 RUNTIME_COMMIT = "d7c2210da8c013e81a94bfc7b811a477c99fd506"
@@ -52,6 +66,10 @@ TORCH_INDEX_URLS = {
     "cu126": "https://download.pytorch.org/whl/cu126",
     "cu128": "https://download.pytorch.org/whl/cu128",
 }
+INSTALL_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+HEARTBEAT_INTERVAL_SECONDS = 2.0
+COMMAND_POLL_INTERVAL_SECONDS = 0.25
+PROCESS_STOP_TIMEOUT_SECONDS = 8.0
 
 
 class InstallFailure(RuntimeError):
@@ -68,6 +86,12 @@ class InstallerConfig:
     source_archive: Path | None = None
     skip_dependencies: bool = False
     minimum_free_bytes: int | None = None
+    install_id: str = field(default_factory=lambda: uuid4().hex)
+    supervise_process_tree: bool = False
+
+    def __post_init__(self) -> None:
+        if not INSTALL_ID_PATTERN.fullmatch(self.install_id):
+            raise ValueError("install_id must be 32 lowercase hexadecimal characters")
 
     @property
     def runtime_root(self) -> Path:
@@ -97,6 +121,22 @@ class InstallerConfig:
     def environments_root(self) -> Path:
         return self.runtime_root / "environments"
 
+    @property
+    def staging_root(self) -> Path:
+        return self.runtime_root / f".staging-{self.install_id}"
+
+    @property
+    def cancel_path(self) -> Path:
+        return self.data_root / "runtime-install-controls" / f"{self.install_id}.cancel.json"
+
+    @property
+    def owner_lock_path(self) -> Path:
+        return self.data_root / "runtime-install-owner.lock"
+
+    @property
+    def owner_metadata_path(self) -> Path:
+        return self.data_root / "runtime-install-owner.json"
+
     def local_runtime_key(self) -> str:
         if self.source_runtime_root is None:
             raise InstallFailure("local runtime source is not configured")
@@ -118,6 +158,17 @@ class RuntimeInstaller:
         self.config = config
         self.cancelled = False
         self.staging_root: Path | None = None
+        self.started_at = ""
+        self.last_output_at = ""
+        self._state: dict[str, Any] = {}
+        self._state_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._active_process: subprocess.Popen[bytes] | None = None
+        self._owner_acquired_at = ""
+        self._owner_token = secrets.token_hex(32)
+        self._owner_endpoint: WindowsOwnerEndpoint | None = None
+        self._process_job = WindowsKillOnCloseJob()
 
     def request_cancel(self, *_args: object) -> None:
         self.cancelled = True
@@ -131,46 +182,108 @@ class RuntimeInstaller:
             config.downloads_root.mkdir(parents=True, exist_ok=True)
         else:
             config.environments_root.mkdir(parents=True, exist_ok=True)
-        self.staging_root = config.runtime_root / f".staging-{uuid4().hex}"
-        self.staging_root.mkdir(parents=True, exist_ok=False)
-        self.write_state("checking_space", progress=0.02)
         try:
-            self.check_cancelled()
-            self.check_disk_space()
-            if config.source_runtime_root is None:
-                archive = self.acquire_archive()
-                self.check_cancelled()
-                source_root = self.extract_archive(archive)
-            else:
-                source_root = config.source_runtime_root.resolve(strict=True)
-                self.write_state(
-                    "using_local_bundle",
-                    progress=0.48,
-                    sourceType="local-bundle",
-                    runtimeRoot=str(source_root),
+            owner_lock = InterprocessFileLock(config.owner_lock_path)
+            owner_lock.acquire()
+        except LockUnavailable as exc:
+            raise InstallFailure("another runtime installation already owns the installer") from exc
+        try:
+            if os.name == "nt":
+                self._owner_endpoint = WindowsOwnerEndpoint(
+                    config.data_root,
+                    install_id=config.install_id,
+                    owner_token=self._owner_token,
                 )
-            self.check_runtime_source(source_root)
-            python_root = self.staging_root / "python"
-            if config.skip_dependencies:
-                self.write_state("skipping_dependencies", progress=0.82)
-                python_executable = Path(sys.executable)
-            else:
-                python_executable = self.install_dependencies(source_root, python_root)
-            self.check_cancelled()
-            result = (
-                self.activate_local(source_root, python_executable)
-                if config.source_runtime_root is not None
-                else self.activate(source_root, python_executable)
+                try:
+                    self._owner_endpoint.start()
+                except LockUnavailable as exc:
+                    raise InstallFailure(
+                        "another runtime installation already owns the installer endpoint"
+                    ) from exc
+            self._activate_process_supervision()
+            existing = read_json(config.state_path, {})
+            if isinstance(existing, dict) and existing.get("installId") == config.install_id:
+                self._state = existing
+            self.started_at = str(self._state.get("startedAt") or utc_now())
+            self.last_output_at = str(self._state.get("lastOutputAt") or self.started_at)
+            self.staging_root = config.staging_root
+            self.staging_root.mkdir(parents=True, exist_ok=False)
+            self._owner_acquired_at = utc_now()
+            atomic_write_json(
+                config.owner_metadata_path,
+                {
+                    "ownerProtocolVersion": 2 if self._owner_endpoint is not None else 1,
+                    "installId": config.install_id,
+                    "pid": os.getpid(),
+                    "acquiredAt": self._owner_acquired_at,
+                    "ownerToken": self._owner_token if self._owner_endpoint is not None else "",
+                },
             )
-            self.write_state("completed", progress=1.0, status="completed", result=result)
-            return result
-        except Exception as exc:
-            status = "cancelled" if self.cancelled else "failed"
-            self.write_state(status, progress=0.0, status=status, error=str(exc))
-            raise
+            self.write_state("checking_space", progress=0.02)
+            self._start_heartbeat()
+            try:
+                self.check_cancelled()
+                self.check_disk_space()
+                if config.source_runtime_root is None:
+                    archive = self.acquire_archive()
+                    self.check_cancelled()
+                    source_root = self.extract_archive(archive)
+                else:
+                    source_root = config.source_runtime_root.resolve(strict=True)
+                    self.write_state(
+                        "using_local_bundle",
+                        progress=0.48,
+                        sourceType="local-bundle",
+                        runtimeRoot=str(source_root),
+                    )
+                self.check_runtime_source(source_root)
+                python_root = self.staging_root / "python"
+                if config.skip_dependencies:
+                    self.write_state("skipping_dependencies", progress=0.82)
+                    python_executable = Path(sys.executable)
+                else:
+                    python_executable = self.install_dependencies(source_root, python_root)
+                self.check_cancelled()
+                result = (
+                    self.activate_local(source_root, python_executable)
+                    if config.source_runtime_root is not None
+                    else self.activate(source_root, python_executable)
+                )
+                self.write_state("completed", progress=1.0, status="completed", result=result)
+                return result
+            except Exception as exc:
+                status = "cancelled" if self.cancelled else "failed"
+                self.write_state(status, progress=0.0, status=status, error=str(exc))
+                raise
+            finally:
+                self._stop_heartbeat()
+                if self.staging_root is not None:
+                    shutil.rmtree(self.staging_root, ignore_errors=True)
+                config.cancel_path.unlink(missing_ok=True)
         finally:
-            if self.staging_root is not None:
-                shutil.rmtree(self.staging_root, ignore_errors=True)
+            owner = read_json(config.owner_metadata_path, {})
+            if (
+                isinstance(owner, dict)
+                and owner.get("installId") == config.install_id
+                and (
+                    self._owner_endpoint is None
+                    or owner.get("ownerToken") == self._owner_token
+                )
+            ):
+                config.owner_metadata_path.unlink(missing_ok=True)
+            if self._owner_endpoint is not None:
+                self._owner_endpoint.close()
+                self._owner_endpoint = None
+            owner_lock.release()
+
+    def _activate_process_supervision(self) -> None:
+        if self.config.supervise_process_tree:
+            self._process_job.activate_for_current_process()
+
+    @contextmanager
+    def process_supervision(self) -> Iterator[None]:
+        self._activate_process_supervision()
+        yield
 
     def check_disk_space(self) -> None:
         defaults = (
@@ -228,6 +341,7 @@ class RuntimeInstaller:
                     output.write(chunk)
                     if downloaded % (8 * 1024 * 1024) < len(chunk):
                         fraction = downloaded / total if total else 0.0
+                        self._mark_output_activity()
                         self.write_state(
                             "downloading",
                             progress=min(0.27, 0.06 + fraction * 0.21),
@@ -429,6 +543,8 @@ class RuntimeInstaller:
                             raise InstallFailure("NLTK data archive exceeds the 32 MiB limit")
                         digest.update(chunk)
                         output.write(chunk)
+                        if downloaded % (8 * 1024 * 1024) < len(chunk):
+                            self._mark_output_activity()
                 if digest.hexdigest() != NLTK_DATA_SHA256:
                     raise InstallFailure("NLTK data archive checksum mismatch")
                 os.replace(partial, archive)
@@ -494,16 +610,35 @@ class RuntimeInstaller:
         log_path = self.config.data_root / "runtime-install.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("ab") as log_handle:
-            completed = subprocess.run(
+            last_size = self._log_size(log_path)
+            process = subprocess.Popen(
                 command,
                 cwd=str(self.staging_root),
-                check=False,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=self._command_creation_flags(),
+                start_new_session=os.name != "nt",
             )
-        if completed.returncode != 0:
-            raise InstallFailure(f"{step} failed with exit code {completed.returncode}")
+            self._active_process = process
+            try:
+                while True:
+                    return_code = process.poll()
+                    current_size = self._log_size(log_path)
+                    if current_size > last_size:
+                        last_size = current_size
+                        self._mark_output_activity()
+                    if return_code is not None:
+                        break
+                    try:
+                        self.check_cancelled()
+                    except InstallFailure:
+                        self._terminate_owned_process(process)
+                        raise
+                    time.sleep(COMMAND_POLL_INTERVAL_SECONDS)
+            finally:
+                self._active_process = None
+        if return_code != 0:
+            raise InstallFailure(f"{step} failed with exit code {return_code}")
 
     def activate(self, source_root: Path, python_executable: Path) -> dict[str, Any]:
         if self.staging_root is None:
@@ -606,8 +741,123 @@ class RuntimeInstaller:
         return current
 
     def check_cancelled(self) -> None:
+        if self._control_file_requests_cancel():
+            self.cancelled = True
         if self.cancelled:
             raise InstallFailure("runtime installation cancelled")
+
+    def _control_file_requests_cancel(self) -> bool:
+        control = read_json(self.config.cancel_path, {})
+        return bool(
+            isinstance(control, dict)
+            and control.get("installId") == self.config.install_id
+            and (
+                self._owner_endpoint is None
+                or control.get("ownerToken") == self._owner_token
+            )
+        )
+
+    def _start_heartbeat(self) -> None:
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"tts-runtime-install-{self.config.install_id[:8]}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=HEARTBEAT_INTERVAL_SECONDS + 1.0)
+        self._heartbeat_thread = None
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+            if self._control_file_requests_cancel():
+                self.cancelled = True
+            self._touch_heartbeat()
+
+    def _touch_heartbeat(self) -> None:
+        now = utc_now()
+        with self._state_lock:
+            state = self._merged_state_from_disk()
+            if not state:
+                return
+            self._state = self._with_cancel_overlay(
+                {**state, "heartbeatAt": now, "updatedAt": now}
+            )
+            atomic_write_json(self.config.state_path, self._state)
+
+    def _mark_output_activity(self) -> None:
+        self.last_output_at = utc_now()
+        with self._state_lock:
+            state = self._merged_state_from_disk()
+            if not state:
+                return
+            self._state = self._with_cancel_overlay(
+                {
+                    **state,
+                    "lastOutputAt": self.last_output_at,
+                    "heartbeatAt": self.last_output_at,
+                    "updatedAt": self.last_output_at,
+                }
+            )
+            atomic_write_json(self.config.state_path, self._state)
+
+    def _merged_state_from_disk(self) -> dict[str, Any]:
+        disk = read_json(self.config.state_path, {})
+        if isinstance(disk, dict) and disk.get("installId") == self.config.install_id:
+            return {**self._state, **disk}
+        return self._state.copy()
+
+    def _with_cancel_overlay(self, state: dict[str, Any]) -> dict[str, Any]:
+        if not self._control_file_requests_cancel() or state.get("status") not in {
+            "starting",
+            "running",
+            "cancelling",
+        }:
+            return state
+        return {
+            **state,
+            "status": "cancelling",
+            "step": "cancelling",
+            "cancelRequested": True,
+        }
+
+    @staticmethod
+    def _log_size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _command_creation_flags() -> int:
+        if os.name != "nt":
+            return 0
+        return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
+
+    @staticmethod
+    def _terminate_owned_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            terminate_windows_process_tree(process.pid)
+        else:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                process.kill()
+            else:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
 
     def write_state(
         self,
@@ -619,21 +869,36 @@ class RuntimeInstaller:
         result: dict[str, Any] | None = None,
         **extra: Any,
     ) -> None:
-        payload = {
-            "status": status,
-            "step": step,
-            "progress": max(0.0, min(1.0, progress)),
-            "pid": os.getpid(),
-            "version": RUNTIME_VERSION,
-            "commit": RUNTIME_COMMIT,
-            "device": self.config.device,
-            "updatedAt": utc_now(),
-            "error": error,
-            **extra,
-        }
-        if result is not None:
-            payload["result"] = result
-        atomic_write_json(self.config.state_path, payload)
+        now = utc_now()
+        with self._state_lock:
+            payload = self._with_cancel_overlay(
+                {
+                    **self._merged_state_from_disk(),
+                    "status": status,
+                    "step": step,
+                    "progress": max(0.0, min(1.0, progress)),
+                    "pid": os.getpid(),
+                    "version": RUNTIME_VERSION,
+                    "commit": RUNTIME_COMMIT,
+                    "device": self.config.device,
+                    "installId": self.config.install_id,
+                    "ownerProtocolVersion": 2 if self._owner_endpoint is not None else 1,
+                    "ownerPid": os.getpid(),
+                    "ownerAcquiredAt": self._owner_acquired_at or now,
+                    "ownerToken": self._owner_token if self._owner_endpoint is not None else "",
+                    "startedAt": self.started_at or now,
+                    "heartbeatAt": now,
+                    "lastOutputAt": self.last_output_at or now,
+                    "stagingRoot": str(self.staging_root or self.config.staging_root),
+                    "updatedAt": now,
+                    "error": error,
+                    **extra,
+                }
+            )
+            if result is not None:
+                payload["result"] = result
+            self._state = payload
+            atomic_write_json(self.config.state_path, payload)
 
 
 def utc_now() -> str:
@@ -644,7 +909,17 @@ def atomic_write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        replace_file_with_retry(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
 
 
 def parse_args(argv: list[str] | None = None) -> InstallerConfig:
@@ -654,6 +929,7 @@ def parse_args(argv: list[str] | None = None) -> InstallerConfig:
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--device", choices=sorted(TORCH_INDEX_URLS), required=True)
     parser.add_argument("--source-runtime-root")
+    parser.add_argument("--install-id", default=uuid4().hex)
     args = parser.parse_args(argv)
     return InstallerConfig(
         assets_root=Path(args.assets_root).resolve(),
@@ -663,6 +939,8 @@ def parse_args(argv: list[str] | None = None) -> InstallerConfig:
         source_runtime_root=(
             Path(args.source_runtime_root).resolve() if args.source_runtime_root else None
         ),
+        install_id=args.install_id,
+        supervise_process_tree=True,
     )
 
 

@@ -210,7 +210,7 @@
         else state.settings.voices.push(next);
         state.settings.activeVoiceId = next.id;
         renderVoices();
-        showMessage("已应用权重候选；请为该声线选择参考音频并保存设置。 ");
+        showMessage("已应用权重候选，但当前改动尚未保存。请选择参考音频，再点击“保存设置”；关闭或刷新页面会丢失未保存的声线改动。", true);
       });
     });
   }
@@ -245,12 +245,78 @@
 
   function renderInstall(install) {
     const running = Boolean(install?.running);
-    const progress = Number(install?.progress) || 0;
-    const percent = Math.round(progress * 100);
     const status = install?.status || "idle";
     const step = install?.step || status;
-    elements.runtimeProgress.value = progress;
-    elements.runtimeInstallStatus.textContent = `${status} · ${step} · ${percent}%${install?.error ? ` · ${install.error}` : ""}`;
+    const statusLabels = {
+      idle: "等待安装",
+      starting: "正在启动安装器",
+      running: "正在安装",
+      cancelling: "正在安全取消",
+      completed: "安装完成",
+      failed: "安装失败",
+      cancelled: "安装已取消",
+      interrupted: "安装已中断"
+    };
+    const stepLabels = {
+      starting: "准备安装任务",
+      checking_space: "检查磁盘空间",
+      downloading: "下载运行环境源码",
+      downloaded: "源码下载完成",
+      extracting: "解压运行环境源码",
+      extracted: "源码解压完成",
+      using_local_bundle: "使用本地模型包",
+      creating_environment: "创建独立 Python 环境",
+      installing_build_tools: "安装基础构建工具",
+      installing_torch: "下载并安装 PyTorch",
+      installing_onnx: "安装 ONNX Runtime",
+      installing_opencc: "安装 OpenCC",
+      installing_extra_requirements: "安装扩展依赖",
+      installing_runtime_requirements: "安装 GPT-SoVITS 依赖",
+      downloading_nltk_data: "下载语言处理数据",
+      nltk_ready: "语言处理数据已就绪",
+      verifying_environment: "验证运行环境",
+      activating: "启用新运行环境",
+      cancelling: "正在安全取消",
+      cancelled: "安装已取消",
+      completed: "安装完成",
+      failed: "安装失败",
+      interrupted: "安装器已中断"
+    };
+    const details = [statusLabels[status] || status, stepLabels[step] || step];
+    const bytesDownloaded = Number(install?.bytesDownloaded);
+    const bytesTotal = Number(install?.bytesTotal);
+    if (
+      step === "downloading"
+      && Number.isFinite(bytesDownloaded)
+      && Number.isFinite(bytesTotal)
+      && bytesTotal > 0
+    ) {
+      const downloadedMiB = (bytesDownloaded / 1024 / 1024).toFixed(1);
+      const totalMiB = (bytesTotal / 1024 / 1024).toFixed(1);
+      const byteProgress = Math.max(0, Math.min(1, bytesDownloaded / bytesTotal));
+      details.push(`${downloadedMiB} / ${totalMiB} MiB（${Math.round(byteProgress * 100)}%）`);
+      elements.runtimeProgress.value = byteProgress;
+    } else if (status === "completed") {
+      elements.runtimeProgress.value = 1;
+    } else if (running) {
+      elements.runtimeProgress.removeAttribute("value");
+    } else {
+      elements.runtimeProgress.value = 0;
+    }
+    if (running && install?.external) details.push("安装正在后台继续，可关闭或重开此页面");
+    if (install?.cancelRequested) details.push("已发送取消请求，正在安全停止当前安装步骤");
+    if (install?.lastActivityAt) {
+      const activity = new Date(install.lastActivityAt);
+      const display = Number.isNaN(activity.getTime())
+        ? install.lastActivityAt
+        : activity.toLocaleString("zh-CN", { hour12: false });
+      details.push(`最后活动：${display}`);
+    }
+    const errorLabels = {
+      "runtime installer stopped reporting activity; retry is safe": "安装器长时间未上报活动，可以安全重试"
+    };
+    if (install?.error) details.push(errorLabels[install.error] || install.error);
+    elements.runtimeInstallStatus.textContent = details.join(" · ");
     const logs = [];
     if (install?.logTail) logs.push(`[INSTALL]\n${install.logTail}`);
     if (state.runtime?.logTail) logs.push(`[RUNTIME]\n${state.runtime.logTail}`);
@@ -259,7 +325,7 @@
     elements.installRuntimeButton.disabled = running || !completeBundle;
     elements.installRuntimeButton.textContent = install?.installed ? "修复本机环境" : "配置本机环境";
     elements.installOnlineRuntimeButton.disabled = running;
-    elements.cancelRuntimeButton.disabled = !running;
+    elements.cancelRuntimeButton.disabled = !running || Boolean(install?.cancelRequested);
     elements.runtimeDevice.disabled = running;
   }
 
@@ -525,8 +591,8 @@
       renderVoices();
       renderInstall(state.install || {});
       showMessage(result.active?.manifest?.runtime
-        ? "完整 TTS 包已启用；现在可以配置本机环境。"
-        : "模型包已启用，但其中没有可用的 GPT-SoVITS runtime。", !result.active?.manifest?.runtime);
+        ? "完整 TTS 包已启用。启用模型包不会自动保存声线设置：请应用权重候选、选择参考音频，再点击“保存设置”。"
+        : "模型包已启用，但其中没有可用的 GPT-SoVITS runtime；声线映射仍需单独点击“保存设置”。", !result.active?.manifest?.runtime);
     } catch (error) { showMessage(error.message, true); }
   });
   elements.deactivateModelPackButton.addEventListener("click", async () => {
