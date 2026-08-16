@@ -20,6 +20,13 @@ from typing import Any, TextIO
 from uuid import uuid4
 
 from .model_pack import ModelPackError, scan_model_pack, validate_model_pack_manifest
+from .supervision import (
+    InterprocessFileLock,
+    LockUnavailable,
+    interprocess_lock_is_held,
+    probe_windows_owner_endpoint,
+    replace_file_with_retry,
+)
 
 EXTENSION_ID = "com.fantareal.tts-studio"
 PROVIDER_ID = "gpt-sovits"
@@ -33,6 +40,12 @@ MAX_PREVIEW_AUDIO_BYTES = 6 * 1024 * 1024
 MODEL_PACK_REFERENCE_PREFIX = "model-pack:"
 ACTIVE_MODEL_PACK_KIND = "fantareal.active-model-pack"
 RUNTIME_DEVICES = {"auto", "cpu", "cu126", "cu128"}
+RUNTIME_INSTALL_ACTIVE_STATUSES = {"starting", "running", "cancelling"}
+RUNTIME_INSTALL_HEARTBEAT_STALE_SECONDS = 120.0
+RUNTIME_INSTALL_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+RUNTIME_INSTALL_LAUNCH_TIMEOUT_SECONDS = 30.0
+RUNTIME_INSTALL_HANDOFF_TIMEOUT_SECONDS = 10.0
+RUNTIME_INSTALL_LAUNCH_MUTEX = threading.Lock()
 AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
 ASSET_RULES = {
     "gpt": ({".ckpt"}, MAX_MODEL_BYTES),
@@ -114,6 +127,17 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def timestamp_is_fresh(value: Any, *, max_age_seconds: float) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return False
+    age = (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds()
+    return -5.0 <= age <= max_age_seconds
+
+
 def json_copy(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False))
 
@@ -156,7 +180,10 @@ def atomic_write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        replace_file_with_retry(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -375,6 +402,27 @@ class TtsStudioService:
     @property
     def runtime_install_log_path(self) -> Path:
         return self._require_layout().data / "runtime-install.log"
+
+    def runtime_install_control_path(self, install_id: str) -> Path:
+        if not RUNTIME_INSTALL_ID_PATTERN.fullmatch(install_id):
+            raise RpcFailure(-32059, "runtime install identity is invalid")
+        return (
+            self._require_layout().data
+            / "runtime-install-controls"
+            / f"{install_id}.cancel.json"
+        )
+
+    @property
+    def runtime_install_launch_lock_path(self) -> Path:
+        return self._require_layout().data / "runtime-install-launch.lock"
+
+    @property
+    def runtime_install_owner_lock_path(self) -> Path:
+        return self._require_layout().data / "runtime-install-owner.lock"
+
+    @property
+    def runtime_install_owner_metadata_path(self) -> Path:
+        return self._require_layout().data / "runtime-install-owner.json"
 
     @property
     def runtime_log_path(self) -> Path:
@@ -636,18 +684,38 @@ class TtsStudioService:
                 else:
                     check("referenceAudio", True, "ok", "reference audio is available")
 
-            for key, suffixes, label, code in (
-                ("gptWeights", {".ckpt"}, "GPT weights", "gpt_weights_unavailable"),
-                ("sovitsWeights", {".pth", ".pt"}, "SoVITS weights", "sovits_weights_unavailable"),
+            for key, suffixes, label, unavailable_code, missing_code in (
+                (
+                    "gptWeights",
+                    {".ckpt"},
+                    "GPT weights",
+                    "gpt_weights_unavailable",
+                    "gpt_weights_missing",
+                ),
+                (
+                    "sovitsWeights",
+                    {".pth", ".pt"},
+                    "SoVITS weights",
+                    "sovits_weights_unavailable",
+                    "sovits_weights_missing",
+                ),
             ):
                 value = str(voice.get(key) or "").strip()
                 if not value:
-                    check(key, True, "ok", f"{label} will use runtime defaults")
+                    if active is not None:
+                        check(
+                            key,
+                            False,
+                            missing_code,
+                            f"active voice {label} are not configured",
+                        )
+                    else:
+                        check(key, True, "ok", f"{label} will use runtime defaults")
                     continue
                 try:
                     model_pack_file(self, value, suffixes)
                 except RpcFailure as exc:
-                    check(key, False, code, exc.message)
+                    check(key, False, unavailable_code, exc.message)
                 else:
                     check(key, True, "ok", f"{label} is available")
 
@@ -921,10 +989,7 @@ class TtsStudioService:
         }
 
     def runtime_install(self, params: dict[str, Any]) -> dict[str, Any]:
-        process = self.installer_process
-        if process is not None and process.poll() is None:
-            return self.runtime_install_status()
-        self.installer_process = None
+        self.runtime_install_status()
         requested_device = str(params.get("device") or self.get_settings()["runtimeDevice"]).lower()
         if requested_device not in RUNTIME_DEVICES:
             raise RpcFailure(-32602, "runtime device is invalid")
@@ -944,76 +1009,250 @@ class TtsStudioService:
             runtime_root = (Path(active["root"]) / str(runtime.get("root") or "")).resolve(
                 strict=True
             )
-        settings = self.get_settings()
-        settings["runtimeDevice"] = requested_device
-        self.save_settings(settings)
-        self.stop_runtime()
-        self._cleanup_runtime_staging()
-        layout = self._require_layout()
-        command = [
-            sys.executable,
-            "-I",
-            "-X",
-            "utf8",
-            "-m",
-            "fantareal_tts_studio.runtime_installer",
-            "--assets-root",
-            str(layout.assets),
-            "--data-root",
-            str(layout.data),
-            "--cache-root",
-            str(layout.cache),
-            "--device",
-            device,
-        ]
-        if runtime_root is not None:
-            command.extend(["--source-runtime-root", str(runtime_root)])
+        with RUNTIME_INSTALL_LAUNCH_MUTEX:
+            launch_lock = InterprocessFileLock(
+                self.runtime_install_launch_lock_path,
+                timeout=RUNTIME_INSTALL_LAUNCH_TIMEOUT_SECONDS,
+            )
+            try:
+                launch_lock.acquire()
+            except LockUnavailable as exc:
+                status = self.runtime_install_status()
+                if status["running"]:
+                    return status
+                raise RpcFailure(-32060, "runtime installer launch gate is busy") from exc
+            try:
+                current_status = self._runtime_install_status(consider_launch_gate=False)
+                if current_status["running"]:
+                    return current_status
+                if current_status["ownerLockHeld"]:
+                    raise RpcFailure(-32062, "another runtime installer owns the install lock")
+                settings = self.get_settings()
+                settings["runtimeDevice"] = requested_device
+                self.save_settings(settings)
+                self.stop_runtime()
+                layout = self._require_layout()
+                install_id = uuid4().hex
+                started_at = utc_now()
+                staging_root = layout.assets / "runtime" / f".staging-{install_id}"
+                control_path = self.runtime_install_control_path(install_id)
+                control_path.parent.mkdir(parents=True, exist_ok=True)
+                control_path.unlink(missing_ok=True)
+                command = [
+                    sys.executable,
+                    "-I",
+                    "-X",
+                    "utf8",
+                    "-m",
+                    "fantareal_tts_studio.runtime_installer",
+                    "--assets-root",
+                    str(layout.assets),
+                    "--data-root",
+                    str(layout.data),
+                    "--cache-root",
+                    str(layout.cache),
+                    "--device",
+                    device,
+                    "--install-id",
+                    install_id,
+                ]
+                if runtime_root is not None:
+                    command.extend(["--source-runtime-root", str(runtime_root)])
+                atomic_write_json(
+                    self.runtime_install_state_path,
+                    {
+                        "status": "starting",
+                        "step": "starting",
+                        "progress": 0.0,
+                        "device": device,
+                        "requestedDevice": requested_device,
+                        "sourceType": source_mode,
+                        "runtimeRoot": str(runtime_root) if runtime_root else "",
+                        "installId": install_id,
+                        "ownerProtocolVersion": 1,
+                        "pid": None,
+                        "startedAt": started_at,
+                        "heartbeatAt": started_at,
+                        "lastOutputAt": started_at,
+                        "stagingRoot": str(staging_root),
+                        "updatedAt": started_at,
+                        "error": "",
+                    },
+                )
+                environment = os.environ.copy()
+                environment["PYTHONUTF8"] = "1"
+                environment["PYTHONIOENCODING"] = "utf-8"
+                try:
+                    with self.runtime_install_log_path.open("ab") as log_handle:
+                        marker = f"\n--- runtime install {install_id} started at {started_at} ---\n"
+                        log_handle.write(marker.encode())
+                        log_handle.flush()
+                        self.installer_process = subprocess.Popen(
+                            command,
+                            cwd=str(layout.assets),
+                            stdout=log_handle,
+                            stderr=subprocess.STDOUT,
+                            env=environment,
+                            creationflags=self._runtime_creation_flags(),
+                        )
+                    state = read_json(self.runtime_install_state_path, {})
+                    if (
+                        isinstance(state, dict)
+                        and state.get("installId") == install_id
+                        and state.get("status") == "starting"
+                    ):
+                        now = utc_now()
+                        atomic_write_json(
+                            self.runtime_install_state_path,
+                            {
+                                **state,
+                                "pid": self.installer_process.pid,
+                                "heartbeatAt": now,
+                                "updatedAt": now,
+                            },
+                        )
+                except OSError as exc:
+                    self._write_runtime_install_start_failure(
+                        install_id=install_id,
+                        device=device,
+                        started_at=started_at,
+                        staging_root=staging_root,
+                        error=f"failed to start runtime installer: {exc}",
+                    )
+                    raise RpcFailure(-32045, f"failed to start runtime installer: {exc}") from exc
+                process = self.installer_process
+                if process is None or not self._wait_for_runtime_install_handoff(
+                    process,
+                    install_id,
+                ):
+                    return_code = None if process is None else process.poll()
+                    if process is not None and return_code is None:
+                        self._terminate_process(process)
+                        return_code = process.poll()
+                    self.installer_process = None
+                    message = f"runtime installer ownership handoff failed (exit {return_code})"
+                    self._write_runtime_install_start_failure(
+                        install_id=install_id,
+                        device=device,
+                        started_at=started_at,
+                        staging_root=staging_root,
+                        error=message,
+                    )
+                    raise RpcFailure(-32061, message)
+                return self._runtime_install_status(consider_launch_gate=False)
+            finally:
+                launch_lock.release()
+
+    def _write_runtime_install_start_failure(
+        self,
+        *,
+        install_id: str,
+        device: str,
+        started_at: str,
+        staging_root: Path,
+        error: str,
+    ) -> None:
+        state = read_json(self.runtime_install_state_path, {})
+        if isinstance(state, dict) and state.get("installId") != install_id:
+            return
         atomic_write_json(
             self.runtime_install_state_path,
             {
-                "status": "starting",
+                **(state if isinstance(state, dict) else {}),
+                "status": "failed",
                 "step": "starting",
                 "progress": 0.0,
                 "device": device,
-                "requestedDevice": requested_device,
-                "sourceType": source_mode,
-                "runtimeRoot": str(runtime_root) if runtime_root else "",
+                "installId": install_id,
+                "ownerProtocolVersion": 1,
+                "startedAt": started_at,
+                "heartbeatAt": utc_now(),
+                "lastOutputAt": started_at,
+                "stagingRoot": str(staging_root),
                 "updatedAt": utc_now(),
-                "error": "",
+                "error": error,
             },
         )
-        self.runtime_install_log_path.write_bytes(b"")
-        environment = os.environ.copy()
-        environment["PYTHONUTF8"] = "1"
-        environment["PYTHONIOENCODING"] = "utf-8"
-        try:
-            with self.runtime_install_log_path.open("ab") as log_handle:
-                self.installer_process = subprocess.Popen(
-                    command,
-                    cwd=str(layout.assets),
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    env=environment,
-                    creationflags=self._runtime_creation_flags(),
-                )
-        except OSError as exc:
-            atomic_write_json(
-                self.runtime_install_state_path,
-                {
-                    "status": "failed",
-                    "step": "starting",
-                    "progress": 0.0,
-                    "device": device,
-                    "updatedAt": utc_now(),
-                    "error": f"failed to start runtime installer: {exc}",
-                },
-            )
-            raise RpcFailure(-32045, f"failed to start runtime installer: {exc}") from exc
-        return self.runtime_install_status()
+
+    def _wait_for_runtime_install_handoff(
+        self,
+        process: subprocess.Popen[bytes],
+        install_id: str,
+        *,
+        timeout: float = RUNTIME_INSTALL_HANDOFF_TIMEOUT_SECONDS,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = read_json(self.runtime_install_state_path, {})
+            if (
+                isinstance(state, dict)
+                and state.get("installId") == install_id
+                and state.get("ownerAcquiredAt")
+            ):
+                if state.get("status") not in RUNTIME_INSTALL_ACTIVE_STATUSES:
+                    return True
+                if self._runtime_install_owner_alive(state):
+                    return True
+            if process.poll() is not None:
+                return False
+            time.sleep(0.05)
+        return False
+
+    def _runtime_install_owner_alive(self, state: dict[str, Any]) -> bool:
+        install_id = str(state.get("installId") or "")
+        if not RUNTIME_INSTALL_ID_PATTERN.fullmatch(install_id):
+            return False
+        owner = read_json(self.runtime_install_owner_metadata_path, {})
+        owner_pid = state.get("ownerPid")
+        owner_acquired_at = state.get("ownerAcquiredAt")
+        owner_token = state.get("ownerToken")
+        metadata_pid = owner.get("pid") if isinstance(owner, dict) else None
+        metadata_acquired_at = owner.get("acquiredAt") if isinstance(owner, dict) else None
+        metadata_token = owner.get("ownerToken") if isinstance(owner, dict) else None
+        identity_matches = bool(
+            isinstance(owner, dict)
+            and owner.get("installId") == install_id
+            and isinstance(owner_pid, int)
+            and not isinstance(owner_pid, bool)
+            and owner_pid > 0
+            and isinstance(metadata_pid, int)
+            and not isinstance(metadata_pid, bool)
+            and metadata_pid == owner_pid
+            and isinstance(owner_acquired_at, str)
+            and bool(owner_acquired_at)
+            and isinstance(metadata_acquired_at, str)
+            and metadata_acquired_at == owner_acquired_at
+        )
+        if not identity_matches:
+            return False
+        if os.name != "nt":
+            return bool(interprocess_lock_is_held(self.runtime_install_owner_lock_path))
+        if state.get("ownerProtocolVersion") != 2 or owner.get("ownerProtocolVersion") != 2:
+            return False
+        if (
+            not isinstance(owner_token, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", owner_token)
+            or metadata_token != owner_token
+        ):
+            return False
+        probe = probe_windows_owner_endpoint(self._require_layout().data)
+        identity = probe.identity
+        return bool(
+            probe.status == "verified"
+            and probe.actual_pid == owner_pid
+            and isinstance(identity, dict)
+            and identity.get("ownerProtocolVersion") == 2
+            and identity.get("installId") == install_id
+            and identity.get("ownerToken") == owner_token
+            and identity.get("pid") == owner_pid
+        )
 
     def runtime_install_status(self) -> dict[str, Any]:
+        return self._runtime_install_status(consider_launch_gate=True)
+
+    def _runtime_install_status(self, *, consider_launch_gate: bool) -> dict[str, Any]:
         process = self.installer_process
-        running = process is not None and process.poll() is None
+        process_alive = process is not None and process.poll() is None
         return_code = None if process is None else process.poll()
         state = read_json(
             self.runtime_install_state_path,
@@ -1026,7 +1265,37 @@ class TtsStudioService:
         )
         if not isinstance(state, dict):
             state = {"status": "invalid", "step": "invalid", "progress": 0.0, "error": ""}
-        if process is not None and not running and state.get("status") in {"running", "starting"}:
+        active_state = state.get("status") in RUNTIME_INSTALL_ACTIVE_STATUSES
+        local_running = process_alive and active_state
+        heartbeat_fresh = timestamp_is_fresh(
+            state.get("heartbeatAt"),
+            max_age_seconds=RUNTIME_INSTALL_HEARTBEAT_STALE_SECONDS,
+        )
+        owner_lock_held = interprocess_lock_is_held(self.runtime_install_owner_lock_path)
+        owner_alive = self._runtime_install_owner_alive(state)
+        owner_endpoint_probe = (
+            probe_windows_owner_endpoint(self._require_layout().data)
+            if os.name == "nt" and state.get("ownerProtocolVersion") == 2
+            else None
+        )
+        owner_endpoint_present = bool(
+            owner_endpoint_probe is not None
+            and owner_endpoint_probe.status in {"verified", "conflict", "indeterminate"}
+        )
+        launch_in_progress = bool(
+            consider_launch_gate
+            and active_state
+            and interprocess_lock_is_held(self.runtime_install_launch_lock_path)
+        )
+        legacy_running = bool(
+            active_state and not state.get("ownerProtocolVersion") and heartbeat_fresh
+        )
+        external_running = bool(
+            process is None
+            and active_state
+            and (owner_alive or launch_in_progress or legacy_running)
+        )
+        if process is not None and not process_alive and active_state:
             state = {
                 **state,
                 "status": "failed",
@@ -1035,36 +1304,115 @@ class TtsStudioService:
                 "updatedAt": utc_now(),
             }
             atomic_write_json(self.runtime_install_state_path, state)
-        if process is not None and not running:
+            active_state = False
+        elif (
+            process is None
+            and active_state
+            and not external_running
+            and not owner_lock_held
+            and not owner_endpoint_present
+        ):
+            state = {
+                **state,
+                "status": "interrupted",
+                "step": "interrupted",
+                "error": "runtime installer stopped reporting activity; retry is safe",
+                "updatedAt": utc_now(),
+            }
+            atomic_write_json(self.runtime_install_state_path, state)
+            active_state = False
+        if process is not None and not process_alive:
             self.installer_process = None
+        running = local_running or external_running
+        install_id = str(state.get("installId") or "")
+        control = (
+            read_json(self.runtime_install_control_path(install_id), {})
+            if RUNTIME_INSTALL_ID_PATTERN.fullmatch(install_id)
+            else {}
+        )
+        cancel_requested = bool(
+            isinstance(control, dict)
+            and control.get("installId") == install_id
+            and (
+                state.get("ownerProtocolVersion") != 2
+                or control.get("ownerToken") == state.get("ownerToken")
+            )
+        )
+        if running and cancel_requested:
+            state = {
+                **state,
+                "status": "cancelling",
+                "step": "cancelling",
+                "cancelRequested": True,
+            }
+        activity_times = [
+            str(state.get(key) or "")
+            for key in ("heartbeatAt", "lastOutputAt", "updatedAt")
+            if state.get(key)
+        ]
         return {
             **state,
             "running": running,
-            "pid": process.pid if running else state.get("pid"),
+            "external": external_running,
+            "ownerAlive": owner_alive,
+            "ownerLockHeld": owner_lock_held,
+            "ownerConflict": (owner_lock_held or owner_endpoint_present) and not owner_alive,
+            "launchInProgress": launch_in_progress,
+            "heartbeatStale": owner_alive and not heartbeat_fresh,
+            "pid": process.pid if local_running else state.get("pid"),
             "returnCode": return_code,
+            "cancelRequested": cancel_requested,
+            "lastActivityAt": max(activity_times, default=""),
             "installed": self._read_runtime_pointer(),
             "logTail": self._read_log_tail(self.runtime_install_log_path),
             "supportedDevices": sorted(RUNTIME_DEVICES),
         }
 
     def cancel_runtime_install(self) -> dict[str, Any]:
-        process = self.installer_process
-        if process is None or process.poll() is not None:
-            self.installer_process = None
-            return self.runtime_install_status()
-        self._terminate_process(process)
-        self.installer_process = None
-        self._cleanup_runtime_staging()
+        status = self.runtime_install_status()
+        if not status["running"]:
+            return status
+        install_id = str(status.get("installId") or "")
+        owner_token = str(status.get("ownerToken") or "")
+        if os.name == "nt" and status.get("ownerProtocolVersion") == 2:
+            current = read_json(self.runtime_install_state_path, {})
+            if (
+                not isinstance(current, dict)
+                or current.get("installId") != install_id
+                or current.get("ownerToken") != owner_token
+                or not self._runtime_install_owner_alive(current)
+            ):
+                return self.runtime_install_status()
+        control_path = self.runtime_install_control_path(install_id)
+        requested_at = utc_now()
+        atomic_write_json(
+            control_path,
+            {
+                "installId": install_id,
+                "ownerToken": owner_token,
+                "requestedAt": requested_at,
+            },
+        )
         previous = read_json(self.runtime_install_state_path, {})
-        state = {
-            **(previous if isinstance(previous, dict) else {}),
-            "status": "cancelled",
-            "step": "cancelled",
-            "progress": 0.0,
-            "updatedAt": utc_now(),
-            "error": "runtime installation cancelled",
-        }
-        atomic_write_json(self.runtime_install_state_path, state)
+        if (
+            isinstance(previous, dict)
+            and previous.get("installId") == install_id
+            and (
+                status.get("ownerProtocolVersion") != 2
+                or previous.get("ownerToken") == owner_token
+            )
+        ):
+            atomic_write_json(
+                self.runtime_install_state_path,
+                {
+                    **previous,
+                    "status": "cancelling",
+                    "step": "cancelling",
+                    "cancelRequested": True,
+                    "cancelRequestedAt": requested_at,
+                    "updatedAt": requested_at,
+                },
+            )
         return self.runtime_install_status()
 
     def launch_runtime(self) -> dict[str, Any]:
@@ -1123,6 +1471,10 @@ class TtsStudioService:
         if active is None:
             self.runtime_model_pack_config_path.unlink(missing_ok=True)
             return None
+        if not str(voice.get("gptWeights") or "").strip():
+            raise RpcFailure(-32058, "active voice GPT weights are not configured")
+        if not str(voice.get("sovitsWeights") or "").strip():
+            raise RpcFailure(-32058, "active voice SoVITS weights are not configured")
         gpt = model_pack_file(self, voice.get("gptWeights"), {".ckpt"})
         sovits = model_pack_file(self, voice.get("sovitsWeights"), {".pth", ".pt"})
         root = Path(active["root"])
@@ -1275,19 +1627,6 @@ class TtsStudioService:
             process.kill()
             process.wait(timeout=8)
 
-    def _cleanup_runtime_staging(self) -> None:
-        runtime_root = self._require_layout().assets / "runtime"
-        runtime_root.mkdir(parents=True, exist_ok=True)
-        canonical_root = runtime_root.resolve(strict=True)
-        for path in runtime_root.glob(".staging-*"):
-            try:
-                if path.is_symlink() or path.resolve(strict=True).parent != canonical_root:
-                    continue
-            except OSError:
-                continue
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-
     def dispatch(self, method: str, params: Any) -> Any:
         values = params if isinstance(params, dict) else {}
         if method == "extension.initialize":
@@ -1298,7 +1637,6 @@ class TtsStudioService:
                 "provider": self.probe() if self.layout else {},
             }
         if method == "extension.shutdown":
-            self.cancel_runtime_install() if self.layout else None
             self.stop_runtime() if self.layout else None
             self.should_stop = True
             return {"stopping": True}
